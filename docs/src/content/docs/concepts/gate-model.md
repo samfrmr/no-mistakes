@@ -121,6 +121,47 @@ not containment evidence. The exception does not extend to another recorded
 head, an abbreviated SHA, or an external, newer, or divergent private head.
 Fresh AXI submissions do not receive this exception.
 
+**Fresh-review recovery exception:** the content-survival scan above is
+provably narrower than "was this content incorporated at all" - it proves
+literal per-line survival of one matched commit's own diff, so a later,
+ordinary, in-lineage commit that *replaces* (not merely extends) a line the
+matched commit introduced is reported at risk even when the replacement was
+itself an already-reviewed fix. Neither Decision 41-A nor a looser diff-shape
+or ancestry heuristic can safely resolve this: a plain revert or a targeted
+malicious deletion produces the identical structural signature as a legitimate
+in-lineage edit (a single-parent commit whose own diff removes exactly the
+matched content), so no automatic rule based on git shape alone can tell them
+apart.
+
+Publication may instead replace a stale private mirror head under a second,
+independent exception when a run resumed a **specific prior terminal run's own
+verified preserved head** via `rerun` (never a fresh `axi run` submission) and
+**freshly completed Review approves that exact, unmodified head**. Concretely,
+ALL of the following, each read from durable, non-git-content, daemon-written
+state - never inferred from commit shape, messages, or ancestry:
+
+- the run carries a recorded recovery source run id, set only at creation by
+  `rerun` resuming that source run's own preserved recovery ref
+  (`refs/no-mistakes/recover/<runID>`);
+- the run made no code changes of its own: its submitted head, its current
+  head, and its durably review-approved head (written only when *this* run's
+  own Review step completes) are all the identical, exact commit being
+  pushed;
+- the source run is terminal, in the same repository and branch, has a
+  verified terminal head, and that recorded head is exactly the commit being
+  pushed;
+- the source run's own recovery ref still points, as a direct commit target,
+  at exactly that head;
+- the stale private mirror head being replaced is exactly the source run's own
+  originally submitted head - an unrelated or already-advanced private branch
+  still refuses exactly as under ordinary reconciliation.
+
+This is deliberately narrow: it authorizes exactly one recovered head to
+receive one fresh, unmodified re-review, not a general content-loss
+heuristic. A run that advances past the recovered head, an ordinary revert, an
+unreviewed deletion, or content discarded by a merge must all still pass the
+ordinary content-survival scan or refuse.
+
 Reconciliation requires direct private branch and archive refs; symbolic refs,
 including dangling symbolic refs, are refused before containment checks. Ref
 creation and deletion use exact names without dereferencing and expected old

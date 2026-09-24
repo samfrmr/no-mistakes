@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/branchsync"
+	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	gatepkg "github.com/kunchenguid/no-mistakes/internal/gate"
 	"github.com/kunchenguid/no-mistakes/internal/git"
@@ -261,7 +262,11 @@ func planGateMirrorReconciliation(ctx context.Context, sctx *pipeline.StepContex
 		}
 		return plan, fmt.Errorf("update gate mirror ref %s before push: stat repository: %w", ref, err)
 	}
-	plan, err := gatepkg.PlanMirrorPublicationReconciliation(ctx, gateDir, sctx.WorkDir, branch, headBeingPushed, runOwnedSubmittedHead(sctx))
+	recoveryExactHead, err := recoveryMirrorExactHead(sctx, headBeingPushed)
+	if err != nil {
+		return gatepkg.StaleBranchPlan{}, fmt.Errorf("update gate mirror ref %s before push: %w", ref, err)
+	}
+	plan, err = gatepkg.PlanMirrorPublicationReconciliation(ctx, gateDir, sctx.WorkDir, branch, headBeingPushed, runOwnedSubmittedHead(sctx), recoveryExactHead)
 	if err != nil {
 		return gatepkg.StaleBranchPlan{}, fmt.Errorf("update gate mirror ref %s before push: %w", ref, err)
 	}
@@ -273,6 +278,96 @@ func runOwnedSubmittedHead(sctx *pipeline.StepContext) string {
 		return ""
 	}
 	return strings.TrimSpace(*sctx.Run.SubmittedHeadSHA)
+}
+
+// recoveryMirrorExactHead computes the fresh-review recovery exception for
+// PlanMirrorPublicationReconciliation, or "" when it does not apply. It is
+// the sole computer of that value: reconcile.go trusts it verbatim once
+// gateHead matches, so every check establishing trust belongs here, not
+// there. See docs/src/content/docs/concepts/gate-model.md (Private mirror
+// reconciliation) for the exception's full rationale.
+//
+// The exception applies only when ALL of the following durable, non-git-
+// content, daemon-written facts hold:
+//   - this run carries a RecoverySourceRunID, set only at creation by a
+//     `rerun` that explicitly resumed a prior terminal run's verified
+//     preserved head (see resolveRerunHead in internal/daemon/manager.go);
+//   - this run made no code changes of its own after that: its
+//     SubmittedHeadSHA, its current HeadSHA, its durably review-approved head
+//     (ReviewApprovedHeadSHA - already required equal-or-ancestor of
+//     headBeingPushed by assertReviewApprovedPushHead, checked here for exact
+//     equality), and headBeingPushed itself are all the identical commit. A
+//     fresh, completed Review of the untouched recovered head is the only new
+//     authority this exception trusts; a run that advanced past its recovered
+//     head must earn ordinary content-survival proof instead;
+//   - the source run is terminal in the same repo and branch, its own
+//     TerminalHeadVerifiedAt is set, and its recorded HeadSHA is exactly
+//     headBeingPushed - the source run is the one that preserved this exact
+//     content;
+//   - the source run's own recovery ref still points, as a direct commit
+//     target, at exactly that head - proof the preserved evidence was never
+//     silently replaced since;
+//   - the returned value is the source run's own SubmittedHeadSHA: the exact
+//     stale gate head being superseded. planStaleBranchReconciliation only
+//     bypasses the scan when the CURRENT gate ref equals this value, so an
+//     unrelated or already-advanced gate branch still refuses exactly as
+//     before.
+//
+// Any failed or ambiguous check returns "" (no exception), never an error -
+// this is an optional bypass, and its absence leaves the existing
+// content-survival refusal fully in force.
+func recoveryMirrorExactHead(sctx *pipeline.StepContext, headBeingPushed string) (string, error) {
+	run, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		return "", fmt.Errorf("load run before recovery mirror check: %w", err)
+	}
+	if run == nil || run.RecoverySourceRunID == nil || strings.TrimSpace(*run.RecoverySourceRunID) == "" {
+		return "", nil
+	}
+	if run.SubmittedHeadSHA == nil || strings.TrimSpace(*run.SubmittedHeadSHA) != headBeingPushed {
+		return "", nil
+	}
+	if run.ReviewApprovedHeadSHA == nil || strings.TrimSpace(*run.ReviewApprovedHeadSHA) != headBeingPushed {
+		return "", nil
+	}
+	if strings.TrimSpace(run.HeadSHA) != headBeingPushed {
+		return "", nil
+	}
+	sourceID := strings.TrimSpace(*run.RecoverySourceRunID)
+	source, err := sctx.DB.GetRun(sourceID)
+	if err != nil {
+		return "", fmt.Errorf("load recovery source run %s: %w", sourceID, err)
+	}
+	if source == nil || source.RepoID != run.RepoID || source.Branch != run.Branch {
+		return "", nil
+	}
+	if !source.Status.Terminal() || source.TerminalHeadVerifiedAt == nil {
+		return "", nil
+	}
+	if strings.TrimSpace(source.HeadSHA) != headBeingPushed {
+		return "", nil
+	}
+	if source.SubmittedHeadSHA == nil || strings.TrimSpace(*source.SubmittedHeadSHA) == "" {
+		return "", nil
+	}
+	gateDir := strings.TrimSpace(sctx.GateDir)
+	if gateDir == "" {
+		return "", nil
+	}
+	recoveryRef := custody.RecoveryRef(source.ID)
+	target, exists, err := git.ExactRefTarget(sctx.Ctx, gateDir, recoveryRef)
+	if err != nil {
+		return "", fmt.Errorf("inspect recovery source ref for run %s: %w", source.ID, err)
+	}
+	if !exists || strings.TrimSpace(target) != headBeingPushed {
+		return "", nil
+	}
+	if resolved, resolveErr := git.Run(sctx.Ctx, gateDir, "rev-parse", recoveryRef+"^{commit}"); resolveErr != nil || strings.TrimSpace(resolved) != headBeingPushed {
+		// Not a direct pointer at a commit (a tag, or something has changed
+		// underneath it) - refuse the exception rather than trust it further.
+		return "", nil
+	}
+	return strings.TrimSpace(*source.SubmittedHeadSHA), nil
 }
 
 func updateGateMirrorAfterPush(ctx context.Context, sctx *pipeline.StepContext, ref, headBeingPushed string, mirrorPlan gatepkg.StaleBranchPlan) (err error) {

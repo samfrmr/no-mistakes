@@ -54,18 +54,33 @@ func ReconcileStaleBranch(ctx context.Context, gateDir, workDir, branch, liveHea
 // submissions must leave it empty. The contract and rationale are owned by
 // docs/src/content/docs/concepts/gate-model.md (Private mirror reconciliation).
 func PlanStaleBranchReconciliation(ctx context.Context, gateDir, workDir, branch, liveHead, runOwnedHead string) (StaleBranchPlan, error) {
-	return planStaleBranchReconciliation(ctx, gateDir, workDir, branch, liveHead, runOwnedHead, false)
+	return planStaleBranchReconciliation(ctx, gateDir, workDir, branch, liveHead, runOwnedHead, "", false)
 }
 
-func PlanMirrorPublicationReconciliation(ctx context.Context, gateDir, workDir, branch, liveHead, runOwnedHead string) (StaleBranchPlan, error) {
-	return planStaleBranchReconciliation(ctx, gateDir, workDir, branch, liveHead, runOwnedHead, true)
+// PlanMirrorPublicationReconciliation is PlanStaleBranchReconciliation for the
+// publish-time caller (push.go), which additionally may supply
+// recoveryExactHead: a second, independent policy exception from Decision
+// 41-A. See planStaleBranchReconciliation's doc comment for its exact
+// contract; push.go's recoveryMirrorExactHead is the only computer of it.
+func PlanMirrorPublicationReconciliation(ctx context.Context, gateDir, workDir, branch, liveHead, runOwnedHead, recoveryExactHead string) (StaleBranchPlan, error) {
+	return planStaleBranchReconciliation(ctx, gateDir, workDir, branch, liveHead, runOwnedHead, recoveryExactHead, true)
 }
 
-func planStaleBranchReconciliation(ctx context.Context, gateDir, workDir, branch, liveHead, runOwnedHead string, preserveDescendants bool) (StaleBranchPlan, error) {
+// planStaleBranchReconciliation supports two independent, additive policy
+// exceptions to the content-survival scan, both compared against the STALE
+// gate ref (never the live head): runOwnedHead is Decision 41-A (a run
+// republishing exactly its own already-submitted head); recoveryExactHead is
+// the fresh-review recovery exception (a run whose durably review-approved
+// head is proven, by the caller, to be the exact preserved head of a prior
+// terminal run whose own submitted head is the stale gate ref being
+// replaced). Neither is containment evidence on its own - both are the
+// caller's job to justify before calling; this function only compares refs.
+func planStaleBranchReconciliation(ctx context.Context, gateDir, workDir, branch, liveHead, runOwnedHead, recoveryExactHead string, preserveDescendants bool) (StaleBranchPlan, error) {
 	var plan StaleBranchPlan
 	branch = strings.TrimSpace(branch)
 	liveHead = strings.TrimSpace(liveHead)
 	runOwnedHead = strings.TrimSpace(runOwnedHead)
+	recoveryExactHead = strings.TrimSpace(recoveryExactHead)
 	if branch == "" || liveHead == "" {
 		return plan, fmt.Errorf("reconcile stale gate branch: branch and live head are required")
 	}
@@ -120,7 +135,7 @@ func planStaleBranchReconciliation(ctx context.Context, gateDir, workDir, branch
 			return plan, nil
 		}
 	}
-	if gateHead != runOwnedHead {
+	if gateHead != runOwnedHead && gateHead != recoveryExactHead {
 		atRiskCommits, err := privateCommitsAbsentFromLive(ctx, gateDir, liveHead, gateHead)
 		if err != nil {
 			return plan, fmt.Errorf("compare private mirror content for %s: %w", branchRef, err)

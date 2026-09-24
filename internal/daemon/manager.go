@@ -918,7 +918,7 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 				inheritedPRURL = inheritablePRURL(runs[0])
 			}
 		}
-		runID, err := m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, persistedIntent, db.RunIntentSourceAgent, launchNonce, validationGeneration, requestDigest, storedPRBaseBranch, omitIntent, inheritedPRURL, request)
+		runID, err := m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, persistedIntent, db.RunIntentSourceAgent, launchNonce, validationGeneration, requestDigest, storedPRBaseBranch, omitIntent, inheritedPRURL, "", request)
 		if err != nil {
 			return "", err
 		}
@@ -1078,7 +1078,7 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 	if latestForBranch == nil {
 		return "", fmt.Errorf("no previous run for branch %s", branch)
 	}
-	headSHA, err := resolveRerunHead(ctx, gateDir, branch, latestForBranch)
+	headSHA, recoverySourceRunID, err := resolveRerunHead(ctx, gateDir, branch, callerHeadSHA, latestForBranch)
 	if err != nil {
 		return "", err
 	}
@@ -1122,7 +1122,7 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 	// selected run's decision is inherited and this rerun can only add to it.
 	// The locked start then folds in the operator's live global default, which
 	// likewise can only add omission, never remove it.
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, storedPRBaseBranch, selectedRun.OmitIntent || omitIntent, inheritablePRURL(selectedRun), profiles...)
+	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, storedPRBaseBranch, selectedRun.OmitIntent || omitIntent, inheritablePRURL(selectedRun), recoverySourceRunID, profiles...)
 }
 
 func inheritablePRURL(run *db.Run) string {
@@ -1139,13 +1139,36 @@ func inheritablePRURL(run *db.Run) string {
 	return strings.TrimSpace(*run.PRURL)
 }
 
-func resolveRerunHead(ctx context.Context, gateDir, branch string, latest *db.Run) (string, error) {
+// resolveRerunHead selects the head a `rerun` starts from, and the prior run
+// (if any) that origin should be attributed to for push.go's fresh-review
+// mirror-recovery exception (recoveryMirrorExactHead in
+// internal/pipeline/steps/push.go). recoverySourceRunID is non-empty only
+// when headSHA was resumed from that specific prior terminal run's own
+// verified preserved recovery ref - never inferred later from commit shape.
+//
+// Ordinarily the gate branch itself is the selected head. A terminal run that
+// never published its recorded head is instead resumed from its preserved
+// recovery ref (refs/no-mistakes/recover/<runID>), self-healing that ref from
+// the bare HeadSHA object when it is missing - exactly as before - as long as
+// custody has not since been explicitly returned. Once a guarded branch-sync
+// recovery has returned custody (CustodyReturnedAt != nil), that automatic
+// resumption stops: an ordinary `rerun` reruns the current gate head instead,
+// so a stale gate is never silently reopened underneath an operator who has
+// already reconciled it by other means.
+//
+// The one exception is a caller whose own clean HEAD is EXACTLY that
+// preserved head: proof, from the caller's own worktree, that this rerun
+// deliberately means to resume exactly that recovery. That case still
+// requires the recovery ref's own live evidence - it does not self-heal the
+// ref from the bare object once custody has returned, since fabricating that
+// evidence after the fact is not the same as it having survived intact.
+func resolveRerunHead(ctx context.Context, gateDir, branch, callerHeadSHA string, latest *db.Run) (headSHA, recoverySourceRunID string, err error) {
 	gateHead, err := git.Run(ctx, gateDir, "rev-parse", "refs/heads/"+branch+"^{commit}")
 	if err != nil {
-		return "", fmt.Errorf("resolve gate head: %w", err)
+		return "", "", fmt.Errorf("resolve gate head: %w", err)
 	}
-	if latest == nil || !latest.Status.Terminal() || latest.CustodyReturnedAt != nil || latest.HeadSHA == gateHead {
-		return gateHead, nil
+	if latest == nil || !latest.Status.Terminal() || latest.HeadSHA == gateHead {
+		return gateHead, "", nil
 	}
 	published := ""
 	if latest.LastPushedSHA != nil {
@@ -1154,30 +1177,37 @@ func resolveRerunHead(ctx context.Context, gateDir, branch string, latest *db.Ru
 		published = *latest.SubmittedHeadSHA
 	}
 	if published == latest.HeadSHA || latest.TerminalHeadVerifiedAt == nil {
-		return gateHead, nil
+		return gateHead, "", nil
+	}
+	custodyReturned := latest.CustodyReturnedAt != nil
+	if custodyReturned && (callerHeadSHA == "" || callerHeadSHA != latest.HeadSHA) {
+		return gateHead, "", nil
 	}
 	recoveryRef := custody.RecoveryRef(latest.ID)
 	refTarget, refExists, refErr := git.ExactRefTarget(ctx, gateDir, recoveryRef)
 	if refErr != nil {
-		return "", fmt.Errorf("inspect terminal recovery ref for run %s: %w", latest.ID, refErr)
+		return "", "", fmt.Errorf("inspect terminal recovery ref for run %s: %w", latest.ID, refErr)
 	}
 	if refExists {
 		preserved, preserveErr := git.Run(ctx, gateDir, "rev-parse", recoveryRef+"^{commit}")
 		if preserveErr != nil {
-			return "", fmt.Errorf("refusing rerun: terminal recovery ref for run %s points at non-commit object %s; inspect with `no-mistakes axi status` and reconcile custody first", latest.ID, refTarget)
+			return "", "", fmt.Errorf("refusing rerun: terminal recovery ref for run %s points at non-commit object %s; inspect with `no-mistakes axi status` and reconcile custody first", latest.ID, refTarget)
 		}
 		if preserved != latest.HeadSHA {
-			return "", fmt.Errorf("refusing rerun: terminal recovery ref for run %s points at %s, not recorded unpublished head %s; inspect with `no-mistakes axi status` and reconcile custody first", latest.ID, preserved, latest.HeadSHA)
+			return "", "", fmt.Errorf("refusing rerun: terminal recovery ref for run %s points at %s, not recorded unpublished head %s; inspect with `no-mistakes axi status` and reconcile custody first", latest.ID, preserved, latest.HeadSHA)
 		}
-		return preserved, nil
+		return preserved, latest.ID, nil
+	}
+	if custodyReturned {
+		return "", "", fmt.Errorf("refusing rerun from stale gate head %s: terminal run %s recorded unpublished head %s, but its recovery ref is unavailable after custody was returned; inspect with `no-mistakes axi status` and reconcile custody first", gateHead, latest.ID, latest.HeadSHA)
 	}
 	if preserved, objectErr := git.Run(ctx, gateDir, "rev-parse", latest.HeadSHA+"^{commit}"); objectErr == nil && preserved == latest.HeadSHA {
 		if anchorErr := custody.PreserveRecoveryHead(ctx, gateDir, latest.ID, preserved); anchorErr != nil {
-			return "", fmt.Errorf("preserve terminal head %s before rerun: %w", preserved, anchorErr)
+			return "", "", fmt.Errorf("preserve terminal head %s before rerun: %w", preserved, anchorErr)
 		}
-		return preserved, nil
+		return preserved, latest.ID, nil
 	}
-	return "", fmt.Errorf("refusing rerun from stale gate head %s: terminal run %s recorded unpublished head %s, but that head is unavailable; inspect with `no-mistakes axi status` and reconcile custody first", gateHead, latest.ID, latest.HeadSHA)
+	return "", "", fmt.Errorf("refusing rerun from stale gate head %s: terminal run %s recorded unpublished head %s, but that head is unavailable; inspect with `no-mistakes axi status` and reconcile custody first", gateHead, latest.ID, latest.HeadSHA)
 }
 
 // fetchRunDefaultBranch fetches the trusted branch from the refreshed
@@ -1259,15 +1289,18 @@ func loadRepoConfigAtSHA(ctx context.Context, dir, sha string) *config.RepoConfi
 // A non-empty intent is stamped onto the run as agent-supplied, so the intent
 // step uses it instead of inferring from transcripts.
 func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, prBaseBranch string, omitIntent bool, profiles ...*agentcfg.PiProfile) (string, error) {
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, db.RunIntentSourceAgent, prBaseBranch, omitIntent, "", profiles...)
+	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, db.RunIntentSourceAgent, prBaseBranch, omitIntent, "", "", profiles...)
 }
 
 // startRunWithIntentSource is the common run-creation path. source is empty
 // when no intent is supplied, RunIntentSourceAgent for a new explicit
 // override, and RunIntentSourceRerun for inherited explicit intent.
-func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, prBaseBranch string, omitIntent bool, inheritedPRURL string, profiles ...*agentcfg.PiProfile) (string, error) {
+// recoverySourceRunID is non-empty only for a `rerun` that resumed a prior
+// terminal run's verified preserved recovery head; every other caller passes
+// "".
+func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, prBaseBranch string, omitIntent bool, inheritedPRURL, recoverySourceRunID string, profiles ...*agentcfg.PiProfile) (string, error) {
 	return m.withBranchLock(repo.ID, branch, func() (string, error) {
-		return m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, source, "", "", "", prBaseBranch, omitIntent, inheritedPRURL, profiles...)
+		return m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, source, "", "", "", prBaseBranch, omitIntent, inheritedPRURL, recoverySourceRunID, profiles...)
 	})
 }
 
@@ -1282,7 +1315,7 @@ func (m *RunManager) withBranchLock(repoID, branch string, action func() (string
 
 // startRunWithIntentSourceLocked performs run creation while the caller owns
 // the repository/branch lock. Proof fields are empty for ordinary launches.
-func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, launchNonce, validationGeneration, intentDigest, prBaseBranch string, omitIntent bool, inheritedPRURL string, profiles ...*agentcfg.PiProfile) (string, error) {
+func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, launchNonce, validationGeneration, intentDigest, prBaseBranch string, omitIntent bool, inheritedPRURL, recoverySourceRunID string, profiles ...*agentcfg.PiProfile) (string, error) {
 	branchRole := telemetryBranchRole(branch, repo.DefaultBranch)
 	trackStartFailure := func(stage string) {
 		telemetry.Track("run", telemetry.Fields{
@@ -1376,6 +1409,14 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 			return "", fmt.Errorf("inherit PR URL: %w", err)
 		}
 		run.PRURL = &inherited
+	}
+	if sourceRunID := strings.TrimSpace(recoverySourceRunID); sourceRunID != "" {
+		if err := m.db.SetRunRecoverySourceRunID(run.ID, sourceRunID); err != nil {
+			m.db.UpdateRunError(run.ID, fmt.Sprintf("record recovery source run: %s", err))
+			trackStartFailure("record_recovery_source_run")
+			return "", fmt.Errorf("record recovery source run: %w", err)
+		}
+		run.RecoverySourceRunID = &sourceRunID
 	}
 
 	// Legacy launches retain their existing failed-row diagnostics on a bad

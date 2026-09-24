@@ -138,6 +138,19 @@ func TestOpenMigratesRunSyncProvenanceWithoutBackfillingMutableHead(t *testing.T
 	if run.LaunchNonce != nil || run.LaunchValidationGeneration != nil || run.LaunchIntentDigest != nil || run.LaunchReceiptClaimedAt != nil || run.PRBaseBranch != nil {
 		t.Fatalf("legacy run gained a launch proof binding: %#v", run)
 	}
+	if run.RecoverySourceRunID != nil {
+		t.Fatalf("legacy run gained a recovery source run id: %#v", run)
+	}
+	if err := d.SetRunRecoverySourceRunID(run.ID, "prior-run"); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := d.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.RecoverySourceRunID == nil || *updated.RecoverySourceRunID != "prior-run" {
+		t.Fatalf("recovery source run id after migration = %#v, want prior-run", updated.RecoverySourceRunID)
+	}
 	var archiveCount int
 	if err := d.sql.QueryRow("SELECT count(*) FROM recovery_archives").Scan(&archiveCount); err != nil || archiveCount != 0 {
 		t.Fatalf("recovery archive migration = count %d, error %v", archiveCount, err)

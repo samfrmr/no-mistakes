@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS runs (
     pr_base_branch       TEXT,
     omit_intent          INTEGER NOT NULL DEFAULT 0,
     pi_profile           TEXT,
+    recovery_source_run_id TEXT,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL
 );
@@ -336,4 +337,10 @@ var migrationStatements = []string{
 	`ALTER TABLE agent_invocations ADD COLUMN workload_lines INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN finding_count INTEGER`,
 	`ALTER TABLE step_results ADD COLUMN approval_reason TEXT`,
+	// Set only at creation by a `rerun` that explicitly resumed a prior
+	// terminal run's verified preserved head (resolveRerunHead). Read by
+	// push.go's recoveryMirrorExactHead to trace fresh-review recovery
+	// provenance back to the exact stale gate head it may supersede; never
+	// inferred later from commit shape or ancestry.
+	`ALTER TABLE runs ADD COLUMN recovery_source_run_id TEXT`,
 }
