@@ -97,12 +97,21 @@ work unchanged.
 
 A rebase can leave the gate branch on an older history that rejects the next
 ordinary push. Reconciliation compares exact commit heads and per-file
-`git patch-id --stable` identities; commit messages are not evidence. Historical
-patch matches also require a clean three-way merge of the private head into the
-live head whose resulting tree equals the live tree. This prevents changes
-discarded by a merge or revert from being counted as surviving content. If that
-survival check cannot prove preservation, the private-only range is reported
-as at risk.
+`git patch-id --stable` identities; commit messages are not evidence. A patch-ID
+match alone is not proof of survival: the specific live commit that carries the
+matching patch must also be shown to still contribute that content at the live
+tip, checked directly against that commit's own diff rather than a single
+whole-tree merge of the private head into the live head. A whole-tree merge's
+base is the old, possibly ancient common ancestor of the two histories, so a
+file both sides independently "add" from that shared point - the private
+commit's own addition, further revised by a later, legitimate live commit such
+as a review-fix round - reads to Git's merge machinery as an unresolvable
+add/add conflict even when nothing was lost. Anchoring the comparison at the
+matched commit's own parent keeps every line it added provably present and
+every line it removed provably absent at the live tip, so a later commit that
+only extends the content passes while one that discards or reverts it (a merge
+using an "ours"-style strategy, most commonly) does not. If that survival check
+cannot prove preservation for a commit, that commit is reported at risk.
 
 **Accepted Decision 41-A (issue #983):** pipeline publication may replace a
 private mirror head that is **exactly equal to `Run.SubmittedHeadSHA`** without

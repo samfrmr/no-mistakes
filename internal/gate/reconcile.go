@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"path/filepath"
@@ -244,9 +245,9 @@ func ArchivedHeadRecorded(ctx context.Context, gateDir, branch, head string) boo
 	return err == nil && objectType == "commit"
 }
 
-// privateCommitsAbsentFromLive names private-only commits lacking matching
-// per-file patches, or the entire private-only range when final-tree survival
-// cannot be proven.
+// privateCommitsAbsentFromLive names private-only commits lacking a matching
+// per-file patch on the live side, or whose matched patch's own contribution
+// cannot be proven to survive to liveHead's tip.
 //
 // The private side is computed first so the live scan can be bounded to the
 // paths the private commits actually touch. Comparison stops at the first
@@ -254,6 +255,21 @@ func ArchivedHeadRecorded(ctx context.Context, gateDir, branch, head string) boo
 // A rebased live head otherwise carries every default-branch
 // commit since the merge base, and hashing each of those files would cost
 // thousands of git invocations to answer a question about a handful of paths.
+//
+// A matched patch is not yet proof of survival: a merge that used a strategy
+// like "ours" can carry an ancestor whose own patch matches while discarding
+// its content from every descendant's tree (see contributionSurvives). That
+// proof deliberately runs the check against the SPECIFIC live commit whose
+// patch matched, not a single whole-tree merge of liveHead against
+// privateHead: a whole-tree merge's base is the old, possibly ancient common
+// ancestor of the two divergent lines, so a file both sides "add" fresh from
+// that base (privateHead's own addition, further extended on the live side by
+// a later, legitimate commit - e.g. a review-fix round revising a
+// just-introduced doc section) is an unresolvable add/add conflict to Git's
+// merge machinery even though nothing was lost. Anchoring the comparison at
+// the matched commit's own parent keeps the base real and adjacent, so a
+// live-side commit that only adds to what the matched commit introduced
+// merges cleanly, while one that discards or replaces it does not.
 func privateCommitsAbsentFromLive(ctx context.Context, repoDir, liveHead, privateHead string) ([]string, error) {
 	privateOnly, err := commitList(ctx, repoDir, "--right-only", liveHead+"..."+privateHead)
 	if err != nil {
@@ -298,44 +314,187 @@ func privateCommitsAbsentFromLive(ctx context.Context, repoDir, liveHead, privat
 			atRisk = append(atRisk, commit.sha)
 			continue
 		}
-		remaining := make(map[string]int, len(livePatches))
-		for patch, count := range livePatches {
-			remaining[patch] = count
+		remaining := make(map[string][]string, len(livePatches))
+		for patch, commits := range livePatches {
+			remaining[patch] = append([]string(nil), commits...)
 		}
+		type match struct{ path, liveCommit string }
+		var matches []match
 		represented := true
 		for _, patch := range commit.patches {
-			if remaining[patch] == 0 {
+			candidates := remaining[patch]
+			if len(candidates) == 0 {
 				represented = false
 				break
 			}
-			remaining[patch]--
+			remaining[patch] = candidates[1:]
+			path, _, _ := strings.Cut(patch, "\x00")
+			matches = append(matches, match{path: path, liveCommit: candidates[0]})
 		}
 		if !represented {
 			atRisk = append(atRisk, commit.sha)
 			continue
 		}
-		for patch, count := range remaining {
-			livePatches[patch] = count
+		survives := true
+		for _, m := range matches {
+			ok, err := contributionSurvives(ctx, repoDir, liveHead, m.path, m.liveCommit)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				survives = false
+				break
+			}
 		}
-	}
-	mergedTree, mergeErr := git.Run(ctx, repoDir, "merge-tree", "--write-tree", liveHead, privateHead)
-	if mergeErr != nil {
-		return privateOnly, nil
-	}
-	liveTree, err := git.Run(ctx, repoDir, "rev-parse", "--verify", liveHead+"^{tree}")
-	if err != nil {
-		return nil, err
-	}
-	if mergedTree != liveTree {
-		return privateOnly, nil
+		if !survives {
+			atRisk = append(atRisk, commit.sha)
+			continue
+		}
+		livePatches = remaining
 	}
 	return atRisk, nil
 }
 
+// contributionSurvives proves that matchedCommit's own patch for path is
+// still reflected in liveHead's current content for that path - i.e. that
+// nothing discarded or replaced it on the way to the tip.
+//
+// A three-way merge anchored at matchedCommit's own parent was tried first
+// and rejected: for a path matchedCommit newly introduces, that parent has no
+// version of it at all, so the merge base is empty exactly like the ancient,
+// far-away merge-base this check exists to avoid. Git's merge machinery
+// treats two additions of the same path with different content as an
+// unresolvable add/add conflict regardless of whether one is a superset of
+// the other, so a legitimate live-only commit that further extends the very
+// file matchedCommit just added (a review-fix round, most commonly) would
+// still spuriously conflict.
+//
+// Instead, the check reasons directly from matchedCommit's own patch, since
+// matchedCommit is necessarily an ancestor of liveHead (it was drawn from the
+// left-only scan of liveHead's own history) rather than a divergent sibling:
+// every line the patch ADDED (relative to matchedCommit's own parent) must
+// still be present in liveHead's content, and every line the patch REMOVED
+// must still be absent there. A later commit that only adds more leaves both
+// true; a later commit that discards or reverts the change (a merge using the
+// "ours" strategy, most commonly) breaks one of them, and the caller keeps
+// the private commit at risk.
+func contributionSurvives(ctx context.Context, repoDir, liveHead, path, matchedCommit string) (bool, error) {
+	parent, comparable, err := firstParentOrEmptyTree(ctx, repoDir, matchedCommit)
+	if err != nil {
+		return false, err
+	}
+	if !comparable {
+		return false, nil
+	}
+	added, removed, textual, err := diffLines(ctx, repoDir, parent, matchedCommit, path)
+	if err != nil {
+		return false, err
+	}
+	if !textual {
+		// A binary file's diff carries no +/- text lines to reason about, so
+		// the line-presence check below would pass vacuously regardless of
+		// what actually changed. Fail closed rather than silently agreeing.
+		return false, nil
+	}
+	ours, err := blobAtPath(ctx, repoDir, liveHead, path)
+	if err != nil {
+		return false, err
+	}
+	ourLines := splitLines(ours)
+	if !linesContainedWithMultiplicity(ourLines, added) {
+		return false, nil
+	}
+	if linesAnyPresent(ourLines, removed) {
+		return false, nil
+	}
+	return true, nil
+}
+
+// diffLines returns the lines a path-scoped diff from -> to adds and removes,
+// with zero context so every returned line is a genuine addition or removal
+// rather than unchanged context git included around a hunk. textual is false
+// for a binary file, whose diff carries no +/- lines to parse at all.
+func diffLines(ctx context.Context, repoDir, from, to, path string) (added, removed []string, textual bool, err error) {
+	diff, err := git.RunRaw(ctx, repoDir, "diff", "--no-ext-diff", "-U0", from, to, "--", ":(literal)"+path)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if bytes.Contains(diff, []byte("\nBinary files ")) || strings.HasPrefix(string(diff), "Binary files ") {
+		return nil, nil, false, nil
+	}
+	for _, line := range strings.Split(string(diff), "\n") {
+		switch {
+		case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "@@"):
+			continue
+		case strings.HasPrefix(line, "+"):
+			added = append(added, line[1:])
+		case strings.HasPrefix(line, "-"):
+			removed = append(removed, line[1:])
+		}
+	}
+	return added, removed, true, nil
+}
+
+func splitLines(content []byte) []string {
+	if len(content) == 0 {
+		return nil
+	}
+	return strings.Split(strings.TrimSuffix(string(content), "\n"), "\n")
+}
+
+// linesContainedWithMultiplicity reports whether every needle appears in
+// haystack at least as many times as it appears in needles.
+func linesContainedWithMultiplicity(haystack, needles []string) bool {
+	counts := make(map[string]int, len(haystack))
+	for _, line := range haystack {
+		counts[line]++
+	}
+	for _, needle := range needles {
+		if counts[needle] == 0 {
+			return false
+		}
+		counts[needle]--
+	}
+	return true
+}
+
+func linesAnyPresent(haystack, needles []string) bool {
+	if len(needles) == 0 {
+		return false
+	}
+	present := make(map[string]bool, len(haystack))
+	for _, line := range haystack {
+		present[line] = true
+	}
+	for _, needle := range needles {
+		if present[needle] {
+			return true
+		}
+	}
+	return false
+}
+
+// blobAtPath returns path's content at ref, or nil when ref is the empty-tree
+// sentinel or the path does not exist there.
+func blobAtPath(ctx context.Context, repoDir, ref, path string) ([]byte, error) {
+	if ref == git.EmptyTreeSHA {
+		return nil, nil
+	}
+	content, err := git.RunRaw(ctx, repoDir, "show", ref+":"+path)
+	if err != nil {
+		// git show's only expected failure here is "path does not exist at
+		// this commit" - callers already verified ref itself resolves.
+		return nil, nil
+	}
+	return content, nil
+}
+
 // liveSidePatchIDs collects per-file patch identities from the live-only
-// history, restricted to the paths the private side needs proven.
-func liveSidePatchIDs(ctx context.Context, repoDir, liveHead, privateHead string, paths map[string]bool) (map[string]int, error) {
-	livePatches := make(map[string]int)
+// history, restricted to the paths the private side needs proven, keyed to
+// every live commit that introduced each identity so a caller can verify
+// which specific commit's contribution needs to survive to the tip.
+func liveSidePatchIDs(ctx context.Context, repoDir, liveHead, privateHead string, paths map[string]bool) (map[string][]string, error) {
+	livePatches := make(map[string][]string)
 	if len(paths) == 0 {
 		return livePatches, nil
 	}
@@ -360,7 +519,7 @@ func liveSidePatchIDs(ctx context.Context, repoDir, liveHead, privateHead string
 			if !ok || !paths[path] {
 				continue
 			}
-			livePatches[patch]++
+			livePatches[patch] = append(livePatches[patch], commit)
 		}
 	}
 	return livePatches, nil
@@ -374,20 +533,31 @@ func commitList(ctx context.Context, repoDir string, args ...string) ([]string, 
 	return strings.Fields(out), nil
 }
 
-func perFilePatchIDs(ctx context.Context, repoDir, commit string) ([]string, bool, error) {
+// firstParentOrEmptyTree returns commit's first parent, or the well-known
+// empty-tree SHA for a root commit. comparable is false for a merge commit,
+// whose combined meaning is not safely represented by first-parent patches.
+func firstParentOrEmptyTree(ctx context.Context, repoDir, commit string) (string, bool, error) {
 	parentLine, err := git.Run(ctx, repoDir, "rev-list", "--parents", "-n", "1", commit)
 	if err != nil {
-		return nil, false, err
+		return "", false, err
 	}
 	parents := strings.Fields(parentLine)
 	if len(parents) > 2 {
-		// A merge's combined meaning is not safely represented by first-parent
-		// patches. It remains at risk unless direct ancestry proved containment.
-		return nil, false, nil
+		return "", false, nil
 	}
-	parent := git.EmptyTreeSHA
 	if len(parents) == 2 {
-		parent = parents[1]
+		return parents[1], true, nil
+	}
+	return git.EmptyTreeSHA, true, nil
+}
+
+func perFilePatchIDs(ctx context.Context, repoDir, commit string) ([]string, bool, error) {
+	parent, comparable, err := firstParentOrEmptyTree(ctx, repoDir, commit)
+	if err != nil {
+		return nil, false, err
+	}
+	if !comparable {
+		return nil, false, nil
 	}
 	rawPaths, err := git.RunRaw(ctx, repoDir, "diff-tree", "--root", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z", commit)
 	if err != nil {
