@@ -1,6 +1,7 @@
 package steps
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,10 +10,13 @@ import (
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	gatepkg "github.com/kunchenguid/no-mistakes/internal/gate"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/testgit"
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func setupGateMirror(t *testing.T, sctx *pipeline.StepContext) string {
@@ -1030,6 +1034,247 @@ func TestPushStep_RefusesUniquePrivateMirrorCommitBeforeRemotePush(t *testing.T)
 	if got := gitCmd(t, gateDir, "rev-parse", "refs/heads/feature"); got != privateHead {
 		t.Fatalf("private mirror moved to %s, want unique head %s", got, privateHead)
 	}
+}
+
+// TestPushStep_RecoveryExactHeadReconcilesStaleMirrorForFreshReviewOfPreservedHead
+// reproduces the Monitor recovery scenario end to end: a prior terminal run's
+// unpublished head (liveHead) preserves content unrelated to what is still
+// sitting in the stale private mirror (privateHead) - the same at-risk shape
+// TestPushStep_RefusesUniquePrivateMirrorCommitBeforeRemotePush proves refuses
+// ordinarily. A `rerun` that resumed liveHead unmodified and completed a fresh
+// Review of it (RecoverySourceRunID set, submitted/current/review-approved
+// heads all liveHead, source run terminal with a verified recovery ref
+// matching liveHead and its own SubmittedHeadSHA at privateHead) must publish
+// without the ordinary content-survival refusal.
+func TestPushStep_RecoveryExactHeadReconcilesStaleMirrorForFreshReviewOfPreservedHead(t *testing.T) {
+	nmHome := t.TempDir()
+	t.Setenv("NM_HOME", nmHome)
+
+	upstream := t.TempDir()
+	gitCmd(t, upstream, "init", "--bare")
+	dir, baseSHA, submittedHead := setupGitRepo(t)
+	gitCmd(t, dir, "remote", "add", "origin", upstream)
+	gitCmd(t, dir, "push", "origin", "main")
+	gitCmd(t, dir, "push", "origin", "feature")
+
+	if err := os.WriteFile(filepath.Join(dir, "private-only.txt"), []byte("unique private work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "private-only.txt")
+	gitCmd(t, dir, "commit", "-m", "private-only trailer trim")
+	privateHead := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	gitCmd(t, dir, "reset", "--hard", submittedHead)
+	if err := os.WriteFile(filepath.Join(dir, "live-only.txt"), []byte("live branch work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "live-only.txt")
+	gitCmd(t, dir, "commit", "-m", "live branch work")
+	liveHead := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	// This run resumed liveHead unmodified: submitted, current, and
+	// review-approved heads are all liveHead - the narrow "no code changes of
+	// its own" shape the exception requires.
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, liveHead, config.Commands{})
+	sctx.Repo.UpstreamURL = upstream
+	sctx.Run.Branch = "refs/heads/feature"
+	recordReviewApproval(t, sctx, liveHead)
+
+	p, err := paths.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateDir := p.RepoDir(sctx.Repo.ID)
+	sctx.GateDir = gateDir
+	if err := os.MkdirAll(filepath.Dir(gateDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, filepath.Dir(gateDir), "init", "--bare", filepath.Base(gateDir))
+	gitCmd(t, gateDir, "fetch", dir, privateHead+":refs/heads/feature")
+
+	// The prior terminal run preserved exactly liveHead from a submission that
+	// left the gate stuck at privateHead.
+	sourceRun, err := sctx.DB.InsertRun(sctx.Repo.ID, "refs/heads/feature", privateHead, baseSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sctx.DB.UpdateRunStatusWithVerifiedHead(sourceRun.ID, types.RunFailed, liveHead); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, gateDir, "update-ref", custody.RecoveryRef(sourceRun.ID), liveHead)
+	if err := sctx.DB.SetRunRecoverySourceRunID(sctx.Run.ID, sourceRun.ID); err != nil {
+		t.Fatal(err)
+	}
+	sourceID := sourceRun.ID
+	sctx.Run.RecoverySourceRunID = &sourceID
+
+	if _, err := (&PushStep{}).Execute(sctx); err != nil {
+		t.Fatalf("recovery-sourced push with fresh review authority was refused: %v", err)
+	}
+	if got := gitCmd(t, upstream, "rev-parse", "refs/heads/feature"); got != liveHead {
+		t.Fatalf("remote head = %s, want %s", got, liveHead)
+	}
+	if got := gitCmd(t, gateDir, "rev-parse", "refs/heads/feature"); got != liveHead {
+		t.Fatalf("gate mirror head = %s, want %s", got, liveHead)
+	}
+	if !gatepkg.ArchivedHeadRecorded(context.Background(), gateDir, "feature", privateHead) {
+		t.Fatal("stale private head was not archived by the recovery reconciliation")
+	}
+}
+
+// TestPushStep_RecoveryMirrorExactHead exercises recoveryMirrorExactHead's
+// branch logic directly: every genuine-loss and provenance-gap counterexample
+// from the recovery design must return "" (no exception, ordinary refusal
+// stays in force), and only the fully-verified chain returns a value.
+func TestPushStep_RecoveryMirrorExactHead(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutate  func(t *testing.T, sctx *pipeline.StepContext, gateDir, baseSHA, headSHA string) string // returns want
+		wantErr bool
+	}{
+		{
+			name: "no_recorded_source_run",
+			mutate: func(t *testing.T, sctx *pipeline.StepContext, gateDir, baseSHA, headSHA string) string {
+				recordReviewApproval(t, sctx, headSHA)
+				return ""
+			},
+		},
+		{
+			name: "run_not_freshly_review_approved_to_head",
+			mutate: func(t *testing.T, sctx *pipeline.StepContext, gateDir, baseSHA, headSHA string) string {
+				source := insertTerminalSourceRun(t, sctx, baseSHA, headSHA)
+				gitCmd(t, gateDir, "update-ref", custody.RecoveryRef(source.ID), headSHA)
+				requireSetRecoverySource(t, sctx, source.ID)
+				// No recordReviewApproval: ReviewApprovedHeadSHA stays nil.
+				return ""
+			},
+		},
+		{
+			name: "run_advanced_past_recovered_head",
+			mutate: func(t *testing.T, sctx *pipeline.StepContext, gateDir, baseSHA, headSHA string) string {
+				source := insertTerminalSourceRun(t, sctx, baseSHA, headSHA)
+				gitCmd(t, gateDir, "update-ref", custody.RecoveryRef(source.ID), headSHA)
+				requireSetRecoverySource(t, sctx, source.ID)
+				recordReviewApproval(t, sctx, headSHA)
+				sctx.Run.HeadSHA = baseSHA // the run kept going after recovery
+				return ""
+			},
+		},
+		{
+			name: "source_run_missing",
+			mutate: func(t *testing.T, sctx *pipeline.StepContext, gateDir, baseSHA, headSHA string) string {
+				recordReviewApproval(t, sctx, headSHA)
+				requireSetRecoverySource(t, sctx, "does-not-exist")
+				return ""
+			},
+		},
+		{
+			name: "source_run_not_terminal",
+			mutate: func(t *testing.T, sctx *pipeline.StepContext, gateDir, baseSHA, headSHA string) string {
+				recordReviewApproval(t, sctx, headSHA)
+				source, err := sctx.DB.InsertRun(sctx.Repo.ID, sctx.Run.Branch, headSHA, baseSHA)
+				if err != nil {
+					t.Fatal(err)
+				}
+				gitCmd(t, gateDir, "update-ref", custody.RecoveryRef(source.ID), headSHA)
+				requireSetRecoverySource(t, sctx, source.ID)
+				return ""
+			},
+		},
+		{
+			name: "source_run_head_mismatch",
+			mutate: func(t *testing.T, sctx *pipeline.StepContext, gateDir, baseSHA, headSHA string) string {
+				recordReviewApproval(t, sctx, headSHA)
+				source, err := sctx.DB.InsertRun(sctx.Repo.ID, sctx.Run.Branch, baseSHA, baseSHA)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := sctx.DB.UpdateRunStatusWithVerifiedHead(source.ID, types.RunFailed, baseSHA); err != nil {
+					t.Fatal(err)
+				}
+				gitCmd(t, gateDir, "update-ref", custody.RecoveryRef(source.ID), baseSHA)
+				requireSetRecoverySource(t, sctx, source.ID)
+				return ""
+			},
+		},
+		{
+			name: "recovery_ref_missing",
+			mutate: func(t *testing.T, sctx *pipeline.StepContext, gateDir, baseSHA, headSHA string) string {
+				recordReviewApproval(t, sctx, headSHA)
+				source := insertTerminalSourceRun(t, sctx, baseSHA, headSHA)
+				requireSetRecoverySource(t, sctx, source.ID)
+				return ""
+			},
+		},
+		{
+			name: "recovery_ref_points_elsewhere",
+			mutate: func(t *testing.T, sctx *pipeline.StepContext, gateDir, baseSHA, headSHA string) string {
+				recordReviewApproval(t, sctx, headSHA)
+				source := insertTerminalSourceRun(t, sctx, baseSHA, headSHA)
+				gitCmd(t, gateDir, "update-ref", custody.RecoveryRef(source.ID), baseSHA)
+				requireSetRecoverySource(t, sctx, source.ID)
+				return ""
+			},
+		},
+		{
+			name: "fully_verified_chain",
+			mutate: func(t *testing.T, sctx *pipeline.StepContext, gateDir, baseSHA, headSHA string) string {
+				recordReviewApproval(t, sctx, headSHA)
+				source := insertTerminalSourceRun(t, sctx, baseSHA, headSHA)
+				gitCmd(t, gateDir, "update-ref", custody.RecoveryRef(source.ID), headSHA)
+				requireSetRecoverySource(t, sctx, source.ID)
+				return baseSHA // source's own SubmittedHeadSHA
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, baseSHA, headSHA := setupGitRepo(t)
+			sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+			sctx.Run.Branch = "refs/heads/feature"
+			gateDir := setupGateMirror(t, sctx)
+			gitCmd(t, gateDir, "fetch", dir, baseSHA+":refs/heads/base-object", headSHA+":refs/heads/head-object")
+
+			want := tc.mutate(t, sctx, gateDir, baseSHA, headSHA)
+
+			got, err := recoveryMirrorExactHead(sctx, headSHA)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Fatalf("recoveryMirrorExactHead = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// insertTerminalSourceRun inserts a terminal run whose SubmittedHeadSHA is
+// baseSHA (the stale head it would authorize superseding) and whose verified
+// HeadSHA is headSHA (the exact preserved content) - the source-run shape
+// recoveryMirrorExactHead requires, without yet creating its recovery ref.
+func insertTerminalSourceRun(t *testing.T, sctx *pipeline.StepContext, baseSHA, headSHA string) *db.Run {
+	t.Helper()
+	source, err := sctx.DB.InsertRun(sctx.Repo.ID, sctx.Run.Branch, baseSHA, baseSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sctx.DB.UpdateRunStatusWithVerifiedHead(source.ID, types.RunFailed, headSHA); err != nil {
+		t.Fatal(err)
+	}
+	return source
+}
+
+func requireSetRecoverySource(t *testing.T, sctx *pipeline.StepContext, sourceRunID string) {
+	t.Helper()
+	if err := sctx.DB.SetRunRecoverySourceRunID(sctx.Run.ID, sourceRunID); err != nil {
+		t.Fatal(err)
+	}
+	sctx.Run.RecoverySourceRunID = &sourceRunID
 }
 
 func TestPushStep_GateMirrorUpdateFailurePropagatesError(t *testing.T) {

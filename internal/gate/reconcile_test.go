@@ -591,7 +591,7 @@ func TestReconcileStaleBranchDecision41AExactSubmittedHeadOnly(t *testing.T) {
 			gateDir := filepath.Join(t.TempDir(), "gate.git")
 			reconcileGit(t, "", "init", "--bare", gateDir)
 			reconcileGit(t, gateDir, "fetch", work, privateHead+":refs/heads/feature")
-			plan, err := PlanMirrorPublicationReconciliation(context.Background(), gateDir, work, "feature", liveHead, ownedHead)
+			plan, err := PlanMirrorPublicationReconciliation(context.Background(), gateDir, work, "feature", liveHead, ownedHead, "")
 			if variant != "exact" {
 				if err == nil || plan.Reconcile {
 					t.Fatalf("non-exact submitted head exempted: plan=%+v err=%v", plan, err)
@@ -626,6 +626,88 @@ func TestReconcileStaleBranchDecision41AExactSubmittedHeadOnly(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestReconcileStaleBranchRecoveryExactHeadBypassesReplacedLineFalsePositive
+// reproduces the exact false-positive shape from the Monitor recovery
+// investigation that contributionSurvives' own documented limitation leaves
+// unhandled: a rebased commit's own line is later REPLACED (not merely
+// extended) by a legitimate, later, single-parent, in-lineage commit - e.g.
+// an already-reviewed fix round. This is deliberately different from
+// TestReconcileStaleBranchAcceptsRebasedHeadFurtherExtendedByReviewFix, which
+// covers only pure extension and still passes today; a genuine replacement
+// still refuses under ordinary reconciliation, unresolved by that fix.
+//
+// recoveryExactHead is an additive, separate escape hatch from Decision 41-A:
+// establishing WHY a given value is trustworthy is entirely push.go's job
+// (recoveryMirrorExactHead) and is not re-proven here. This test only proves
+// the git-mechanics half of the contract: the scan is skipped when
+// recoveryExactHead exactly equals the stale gate head, and an unrelated or
+// incorrect value changes nothing.
+func TestReconcileStaleBranchRecoveryExactHeadBypassesReplacedLineFalsePositive(t *testing.T) {
+	ctx := context.Background()
+	work := initReconcileRepo(t)
+	base := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	writeReconcileFile(t, work, "signing.go", "original-line\n")
+	reconcileGit(t, work, "add", "signing.go")
+	reconcileGit(t, work, "commit", "-m", "add signing key custody")
+	gateHead := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	// The default branch advances with an unrelated file while this commit is
+	// pending review.
+	reconcileGit(t, work, "checkout", "--detach", base)
+	writeReconcileFile(t, work, "unrelated.txt", "advance\n")
+	reconcileGit(t, work, "add", "unrelated.txt")
+	reconcileGit(t, work, "commit", "-m", "advance base")
+	newBase := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	// A clean rebase of the private commit onto the moved base.
+	reconcileGit(t, work, "checkout", "-b", "rebased", gateHead)
+	reconcileGit(t, work, "rebase", newBase)
+
+	// A later, ordinary, single-parent, already-reviewed fix commit REPLACES
+	// (not extends) the line the rebased commit introduced - the exact shape
+	// contributionSurvives' own doc comment names as unhandled.
+	writeReconcileFile(t, work, "signing.go", "replaced-by-review-fix\n")
+	reconcileGit(t, work, "add", "signing.go")
+	reconcileGit(t, work, "commit", "-m", "review fix: replace original line")
+	liveHead := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	gateDir := filepath.Join(t.TempDir(), "gate.git")
+	reconcileGit(t, "", "init", "--bare", gateDir)
+	reconcileGit(t, gateDir, "fetch", work, gateHead+":refs/heads/feature")
+
+	// Ordinary reconciliation (no recovery authority) still refuses: this is
+	// the unresolved gap this test documents, not a claim it is fixed here.
+	if plan, err := PlanMirrorPublicationReconciliation(ctx, gateDir, work, "feature", liveHead, "", ""); err == nil || plan.Reconcile {
+		t.Fatalf("replaced-line false positive unexpectedly reconciled without recovery authority: plan=%+v err=%v", plan, err)
+	}
+
+	// An incorrect recoveryExactHead (not equal to the stale gate head) must
+	// not bypass anything either - proof this is not a blanket escape hatch.
+	if plan, err := PlanMirrorPublicationReconciliation(ctx, gateDir, work, "feature", liveHead, "", newBase); err == nil || plan.Reconcile {
+		t.Fatalf("an unrelated recoveryExactHead value bypassed the scan: plan=%+v err=%v", plan, err)
+	}
+
+	// The correct recoveryExactHead - exactly the stale gate head - bypasses
+	// the scan and reconciles, mirroring the shape recoveryMirrorExactHead
+	// computes once its own provenance chain verifies.
+	plan, err := PlanMirrorPublicationReconciliation(ctx, gateDir, work, "feature", liveHead, "", gateHead)
+	if err != nil || !plan.Reconcile || plan.PreviousHead != gateHead {
+		t.Fatalf("verified recoveryExactHead did not reconcile: plan=%+v err=%v", plan, err)
+	}
+	result, err := ApplyStaleBranchReconciliation(ctx, gateDir, plan)
+	if err != nil || !result.Reconciled || result.PreviousHead != gateHead {
+		t.Fatalf("apply after recoveryExactHead plan failed: result=%+v err=%v", result, err)
+	}
+	reconcileGit(t, work, "push", gateDir, liveHead+":refs/heads/feature")
+	if got := reconcileGit(t, gateDir, "rev-parse", "refs/heads/feature"); got != liveHead {
+		t.Fatalf("non-force push reached %s, want %s", got, liveHead)
+	}
+	if !ArchivedHeadRecorded(ctx, gateDir, "feature", gateHead) {
+		t.Fatal("stale gate head was not archived before reconciliation")
 	}
 }
 

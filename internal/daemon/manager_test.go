@@ -1196,19 +1196,22 @@ func TestResolveRerunHeadUsesPreservedTerminalHeadInsteadOfStaleGateBranch(t *te
 	run.TerminalHeadVerifiedAt = &now
 	gitCmd(t, work, "push", gate, preserved+":refs/no-mistakes/recover/"+run.ID)
 
-	head, err := resolveRerunHead(context.Background(), gate, run.Branch, run)
+	head, sourceRunID, err := resolveRerunHead(context.Background(), gate, run.Branch, "", run)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if head != preserved {
 		t.Fatalf("rerun head = %s, want preserved %s", head, preserved)
 	}
+	if sourceRunID != run.ID {
+		t.Fatalf("recovery source run id = %q, want %s", sourceRunID, run.ID)
+	}
 	if gateHead := gitOutput(t, gate, "rev-parse", "refs/heads/feature/recover"); gateHead != submitted {
 		t.Fatalf("rerun resolution moved gate branch = %s, want %s", gateHead, submitted)
 	}
 
 	gitCmd(t, gate, "update-ref", custody.RecoveryRef(run.ID), submitted)
-	if _, err := resolveRerunHead(context.Background(), gate, run.Branch, run); err == nil {
+	if _, _, err := resolveRerunHead(context.Background(), gate, run.Branch, "", run); err == nil {
 		t.Fatal("rerun accepted a mismatched recovery ref")
 	}
 	if got := gitOutput(t, gate, "rev-parse", custody.RecoveryRef(run.ID)); got != submitted {
@@ -1217,7 +1220,7 @@ func TestResolveRerunHeadUsesPreservedTerminalHeadInsteadOfStaleGateBranch(t *te
 
 	blob := gitOutput(t, gate, "hash-object", "-w", filepath.Join(work, "file.txt"))
 	gitCmd(t, gate, "update-ref", custody.RecoveryRef(run.ID), blob)
-	if _, err := resolveRerunHead(context.Background(), gate, run.Branch, run); err == nil {
+	if _, _, err := resolveRerunHead(context.Background(), gate, run.Branch, "", run); err == nil {
 		t.Fatal("rerun accepted an unpeelable recovery ref")
 	}
 	if got := gitOutput(t, gate, "rev-parse", custody.RecoveryRef(run.ID)); got != blob {
@@ -1250,15 +1253,108 @@ func TestResolveRerunHeadUsesAdvancedGateWhenSubmittedHeadWasTerminal(t *testing
 	now := int64(1)
 	run := &db.Run{ID: "run-1", Branch: "feature/recover", Status: types.RunFailed, HeadSHA: submitted, SubmittedHeadSHA: &submitted, TerminalHeadVerifiedAt: &now}
 
-	head, err := resolveRerunHead(context.Background(), gate, run.Branch, run)
+	head, sourceRunID, err := resolveRerunHead(context.Background(), gate, run.Branch, "", run)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if head != advanced {
 		t.Fatalf("rerun head = %s, want advanced gate head %s", head, advanced)
 	}
+	if sourceRunID != "" {
+		t.Fatalf("recovery source run id = %q, want none for an ordinary gate-head rerun", sourceRunID)
+	}
 	if _, err := git.Run(context.Background(), gate, "rev-parse", "--verify", custody.RecoveryRef(run.ID)); err == nil {
 		t.Fatal("rerun created a recovery ref for the already-published submitted head")
+	}
+}
+
+// custodyReturnedRecoveryFixture builds a terminal run whose recorded head was
+// never published and whose custody was later explicitly returned (as a
+// guarded branch-sync recovery does), leaving the gate branch stale at the
+// originally submitted head. It mirrors the Monitor recovery scenario: the
+// preserved head is still recoverable from the run's own recovery ref, but an
+// ordinary rerun must not silently resume it once custody has returned.
+func custodyReturnedRecoveryFixture(t *testing.T) (gate string, run *db.Run, preserved, submitted string) {
+	t.Helper()
+	root := t.TempDir()
+	work := filepath.Join(root, "work")
+	gate = filepath.Join(root, "gate.git")
+	gitCmd(t, "", "init", work)
+	gitCmd(t, work, "config", "user.email", "test@test.com")
+	gitCmd(t, work, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("submitted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, work, "add", "file.txt")
+	gitCmd(t, work, "commit", "-m", "submitted")
+	submitted = gitOutput(t, work, "rev-parse", "HEAD")
+	gitCmd(t, "", "init", "--bare", gate)
+	gitCmd(t, work, "push", gate, "HEAD:refs/heads/feature/recover")
+	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("preserved\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, work, "commit", "-am", "pipeline fix")
+	preserved = gitOutput(t, work, "rev-parse", "HEAD")
+	custodyReturnedAt := int64(2)
+	terminalHeadVerifiedAt := int64(1)
+	run = &db.Run{
+		ID: "run-recovery-source", Branch: "feature/recover", Status: types.RunFailed,
+		HeadSHA: preserved, SubmittedHeadSHA: &submitted,
+		TerminalHeadVerifiedAt: &terminalHeadVerifiedAt, CustodyReturnedAt: &custodyReturnedAt,
+	}
+	gitCmd(t, work, "push", gate, preserved+":refs/no-mistakes/recover/"+run.ID)
+	return gate, run, preserved, submitted
+}
+
+func TestResolveRerunHeadCustodyReturnedResumesOnlyWithMatchingCallerHead(t *testing.T) {
+	t.Parallel()
+	gate, run, preserved, _ := custodyReturnedRecoveryFixture(t)
+
+	head, sourceRunID, err := resolveRerunHead(context.Background(), gate, run.Branch, preserved, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != preserved {
+		t.Fatalf("rerun head = %s, want preserved %s", head, preserved)
+	}
+	if sourceRunID != run.ID {
+		t.Fatalf("recovery source run id = %q, want %s", sourceRunID, run.ID)
+	}
+}
+
+func TestResolveRerunHeadCustodyReturnedWithoutMatchingCallerHeadUsesGateHead(t *testing.T) {
+	t.Parallel()
+	gate, run, preserved, submitted := custodyReturnedRecoveryFixture(t)
+
+	for _, callerHeadSHA := range []string{"", submitted, "0123456789abcdef0123456789abcdef01234567"} {
+		head, sourceRunID, err := resolveRerunHead(context.Background(), gate, run.Branch, callerHeadSHA, run)
+		if err != nil {
+			t.Fatalf("caller head %q: %v", callerHeadSHA, err)
+		}
+		if head != submitted {
+			t.Fatalf("caller head %q: rerun head = %s, want stale gate head %s (custody already returned)", callerHeadSHA, head, submitted)
+		}
+		if sourceRunID != "" {
+			t.Fatalf("caller head %q: recovery source run id = %q, want none", callerHeadSHA, sourceRunID)
+		}
+		if head == preserved {
+			t.Fatalf("caller head %q: silently resumed preserved head after custody was returned", callerHeadSHA)
+		}
+	}
+}
+
+func TestResolveRerunHeadCustodyReturnedRefusesWhenRecoveryRefMissing(t *testing.T) {
+	t.Parallel()
+	gate, run, preserved, _ := custodyReturnedRecoveryFixture(t)
+	if _, err := git.Run(context.Background(), gate, "update-ref", "-d", custody.RecoveryRef(run.ID)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := resolveRerunHead(context.Background(), gate, run.Branch, preserved, run); err == nil {
+		t.Fatal("rerun resumed a custody-returned preserved head with no recovery ref evidence")
+	}
+	if _, err := git.Run(context.Background(), gate, "rev-parse", "--verify", custody.RecoveryRef(run.ID)); err == nil {
+		t.Fatal("refusal fabricated a recovery ref after custody was already returned")
 	}
 }
 
