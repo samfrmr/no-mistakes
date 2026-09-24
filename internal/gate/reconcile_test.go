@@ -278,6 +278,164 @@ func TestArchivedHeadRecordedRejectsUnarchivedClaims(t *testing.T) {
 	}
 }
 
+// TestReconcileStaleBranchAcceptsRebasedHeadFurtherExtendedByReviewFix
+// reproduces the private-mirror false refusal from issue-derived recovery
+// reports: a branch whose two commits were cleanly rebased onto a moved
+// default branch, then further extended by a review-fix commit that revises
+// the very file the rebased commits introduced. Before contributionSurvives
+// existed, the single whole-tree `git merge-tree` comparison used privateHead
+// and liveHead's ancient common ancestor as its merge base, so the freshly
+// introduced file looked like an unresolvable add/add conflict to Git even
+// though every byte of the original commits is still present. This is the
+// "proven ordinary sync path" scenario with one added twist: an additional
+// live-only commit legitimately revises the same file the rebase carried
+// over, which is exactly what a review-fix round after a rebase looks like.
+func TestReconcileStaleBranchAcceptsRebasedHeadFurtherExtendedByReviewFix(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	work := initReconcileRepo(t)
+	base := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	writeReconcileFile(t, work, "signing.md", "signing key custody notes\n")
+	reconcileGit(t, work, "add", "signing.md")
+	reconcileGit(t, work, "commit", "-m", "add signing-key custody notes")
+
+	writeReconcileFile(t, work, "AGENTS.md", "# AGENTS.md\n\n## Self-governance\nInitial note.\n")
+	reconcileGit(t, work, "add", "AGENTS.md")
+	reconcileGit(t, work, "commit", "-m", "add AGENTS.md self-governance section")
+	gateHead := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	// The default branch advances with an unrelated file while this branch's
+	// two commits are pending review.
+	reconcileGit(t, work, "checkout", "--detach", base)
+	writeReconcileFile(t, work, "unrelated.txt", "advance\n")
+	reconcileGit(t, work, "add", "unrelated.txt")
+	reconcileGit(t, work, "commit", "-m", "advance base")
+	newBase := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	// A clean rebase of the two original commits onto the moved base: neither
+	// touches unrelated.txt, so both patches replay verbatim.
+	reconcileGit(t, work, "checkout", "-b", "rebased", gateHead)
+	reconcileGit(t, work, "rebase", newBase)
+
+	// A review-fix round further revises the file the rebase carried over -
+	// an ordinary, legitimate continuation of the same lineage.
+	writeReconcileFile(t, work, "AGENTS.md", "# AGENTS.md\n\n## Self-governance\nInitial note.\n\nMore detail added during review.\n")
+	reconcileGit(t, work, "add", "AGENTS.md")
+	reconcileGit(t, work, "commit", "-m", "review fix: expand self-governance section")
+	liveHead := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	gateDir := filepath.Join(t.TempDir(), "gate.git")
+	reconcileGit(t, "", "init", "--bare", gateDir)
+	reconcileGit(t, gateDir, "fetch", work, gateHead+":refs/heads/feature")
+
+	result, err := ReconcileStaleBranch(ctx, gateDir, work, "feature", liveHead, "")
+	if err != nil || !result.Reconciled || result.PreviousHead != gateHead {
+		t.Fatalf("rebased head further extended by review fix was refused: result=%+v err=%v", result, err)
+	}
+	reconcileGit(t, work, "push", gateDir, liveHead+":refs/heads/feature")
+	if got := reconcileGit(t, gateDir, "rev-parse", "refs/heads/feature"); got != liveHead {
+		t.Fatalf("non-force push reached %s, want %s", got, liveHead)
+	}
+}
+
+// TestReconcileStaleBranchRefusesWhenRebasedReplayDropsPrivateContent is the
+// counterexample: a "rebase" that drops one of the two original commits
+// entirely (as a broken tool or a bad manual replay might) must still be
+// refused, naming the commit whose content never made it into the live head.
+func TestReconcileStaleBranchRefusesWhenRebasedReplayDropsPrivateContent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	work := initReconcileRepo(t)
+	base := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	writeReconcileFile(t, work, "signing.md", "signing key custody notes\n")
+	reconcileGit(t, work, "add", "signing.md")
+	reconcileGit(t, work, "commit", "-m", "add signing-key custody notes")
+	droppedHead := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	writeReconcileFile(t, work, "AGENTS.md", "# AGENTS.md\n\n## Self-governance\nInitial note.\n")
+	reconcileGit(t, work, "add", "AGENTS.md")
+	reconcileGit(t, work, "commit", "-m", "add AGENTS.md self-governance section")
+	gateHead := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	// A "rebase" that only replays the second commit's patch onto the moved
+	// base, silently losing the first commit's file entirely.
+	reconcileGit(t, work, "checkout", "--detach", base)
+	writeReconcileFile(t, work, "unrelated.txt", "advance\n")
+	reconcileGit(t, work, "add", "unrelated.txt")
+	reconcileGit(t, work, "commit", "-m", "advance base")
+	writeReconcileFile(t, work, "AGENTS.md", "# AGENTS.md\n\n## Self-governance\nInitial note.\n")
+	reconcileGit(t, work, "add", "AGENTS.md")
+	reconcileGit(t, work, "commit", "-m", "add AGENTS.md self-governance section")
+	liveHead := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	gateDir := filepath.Join(t.TempDir(), "gate.git")
+	reconcileGit(t, "", "init", "--bare", gateDir)
+	reconcileGit(t, gateDir, "fetch", work, gateHead+":refs/heads/feature")
+
+	result, err := ReconcileStaleBranch(ctx, gateDir, work, "feature", liveHead, "")
+	if err == nil || result.Reconciled {
+		t.Fatalf("genuinely missing content was reconciled: result=%+v err=%v", result, err)
+	}
+	if !strings.Contains(err.Error(), droppedHead) {
+		t.Fatalf("refusal did not name the commit whose content is missing: %v", err)
+	}
+	if got := reconcileGit(t, gateDir, "rev-parse", "refs/heads/feature"); got != gateHead {
+		t.Fatalf("refusal moved the private branch: %s", got)
+	}
+}
+
+// TestReconcileStaleBranchRefusesBinaryContentChangedAfterRebase guards the
+// line-based survival check's fail-closed path: a binary file's diff carries
+// no +/- text lines, so a naive "no lines removed" reading would pass
+// vacuously no matter what actually changed. A live-side commit that
+// overwrites the private commit's binary content after a clean rebase must
+// still be refused.
+func TestReconcileStaleBranchRefusesBinaryContentChangedAfterRebase(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	work := initReconcileRepo(t)
+	base := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	if err := os.WriteFile(filepath.Join(work, "asset.bin"), []byte{0x00, 0x01, 0x02, 0x03}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reconcileGit(t, work, "add", "asset.bin")
+	reconcileGit(t, work, "commit", "-m", "add binary asset")
+	gateHead := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	reconcileGit(t, work, "checkout", "--detach", base)
+	writeReconcileFile(t, work, "unrelated.txt", "advance\n")
+	reconcileGit(t, work, "add", "unrelated.txt")
+	reconcileGit(t, work, "commit", "-m", "advance base")
+	newBase := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	reconcileGit(t, work, "checkout", "-b", "rebased", gateHead)
+	reconcileGit(t, work, "rebase", newBase)
+
+	// A live-only commit overwrites the binary content the rebase carried
+	// over - genuinely different bytes, not an extension of them.
+	if err := os.WriteFile(filepath.Join(work, "asset.bin"), []byte{0xff, 0xee, 0xdd}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reconcileGit(t, work, "add", "asset.bin")
+	reconcileGit(t, work, "commit", "-m", "replace binary asset")
+	liveHead := reconcileGit(t, work, "rev-parse", "HEAD")
+
+	gateDir := filepath.Join(t.TempDir(), "gate.git")
+	reconcileGit(t, "", "init", "--bare", gateDir)
+	reconcileGit(t, gateDir, "fetch", work, gateHead+":refs/heads/feature")
+
+	result, err := ReconcileStaleBranch(ctx, gateDir, work, "feature", liveHead, "")
+	if err == nil || result.Reconciled {
+		t.Fatalf("changed binary content was reconciled: result=%+v err=%v", result, err)
+	}
+	if got := reconcileGit(t, gateDir, "rev-parse", "refs/heads/feature"); got != gateHead {
+		t.Fatalf("refusal moved the private branch: %s", got)
+	}
+}
+
 func initReconcileRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
