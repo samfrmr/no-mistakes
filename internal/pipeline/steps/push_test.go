@@ -1090,7 +1090,11 @@ func TestPushStep_RecoveryExactHeadReconcilesStaleMirrorForFreshReviewOfPreserve
 		t.Fatal(err)
 	}
 	gitCmd(t, filepath.Dir(gateDir), "init", "--bare", filepath.Base(gateDir))
-	gitCmd(t, gateDir, "fetch", dir, privateHead+":refs/heads/feature")
+	// Fetch BOTH sibling heads into the gate: privateHead and liveHead share
+	// parent submittedHead, so fetching privateHead alone leaves liveHead's
+	// object absent and the recovery-ref update-ref below would die with
+	// "nonexistent object" before Execute is ever reached.
+	gitCmd(t, gateDir, "fetch", dir, privateHead+":refs/heads/feature", liveHead+":refs/heads/live-object")
 
 	// The prior terminal run preserved exactly liveHead from a submission that
 	// left the gate stuck at privateHead.
@@ -1156,7 +1160,14 @@ func TestPushStep_RecoveryMirrorExactHead(t *testing.T) {
 				gitCmd(t, gateDir, "update-ref", custody.RecoveryRef(source.ID), headSHA)
 				requireSetRecoverySource(t, sctx, source.ID)
 				recordReviewApproval(t, sctx, headSHA)
-				sctx.Run.HeadSHA = baseSHA // the run kept going after recovery
+				// The run kept going after recovery: recoveryMirrorExactHead
+				// re-reads the run through sctx.DB.GetRun (a fresh SELECT), so
+				// advancing only the in-memory sctx.Run is invisible and the
+				// expected refusal never fires. Make the advance durable.
+				if err := sctx.DB.UpdateRunHeadSHA(sctx.Run.ID, baseSHA); err != nil {
+					t.Fatal(err)
+				}
+				sctx.Run.HeadSHA = baseSHA
 				return ""
 			},
 		},
