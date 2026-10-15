@@ -317,10 +317,12 @@ func TestModel_Yolo_FixesAllActionableFindingsDespiteManualDeselection(t *testin
 func TestModel_Yolo_ApprovesNonActionableFindings(t *testing.T) {
 	sock, client, snapshot := captureRespond(t)
 
+	// Lint, not review: a review gate with no blocking finding is parked on
+	// incomplete coverage, which yolo never approves (see rereview_test.go).
 	run := testRun()
-	run.Steps[0].Status = types.StepStatusAwaitingApproval
-	fj := `{"findings":[{"id":"review-1","severity":"info","description":"fyi","action":"no-op"}],"summary":"1 note"}`
-	run.Steps[0].FindingsJSON = &fj
+	run.Steps[2].Status = types.StepStatusAwaitingApproval
+	fj := `{"findings":[{"id":"lint-1","severity":"info","description":"fyi","action":"no-op"}],"summary":"1 note"}`
+	run.Steps[2].FindingsJSON = &fj
 	m := NewModel(sock, client, run)
 	m.yoloMode = true
 

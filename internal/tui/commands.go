@@ -130,6 +130,17 @@ func (m Model) maybeAutoApproveCmd() tea.Cmd {
 	if !m.approvalReady(step) {
 		return nil
 	}
+	// A review parked on incomplete coverage is never approved by yolo:
+	// approval would certify files nobody read. Yolo asks for the rest of the
+	// review once and then leaves a still-incomplete gate to a human, who can
+	// press f again or knowingly approve.
+	if m.isReviewCoverageGate(step) {
+		if m.yoloRereviewed[step.StepName] {
+			return nil
+		}
+		m.yoloRereviewed[step.StepName] = true
+		return m.respondCmd(types.ActionRereview)
+	}
 	if step.Status != types.StepStatusFixReview && !m.yoloFixed[step.StepName] && m.stepHasActionableFindings(step.StepName) {
 		m.yoloFixed[step.StepName] = true
 		m.resetFindingSelection(step.StepName)

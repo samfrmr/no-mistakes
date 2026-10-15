@@ -71,3 +71,34 @@ func TestModel_FixKeyOutsideACoverageGateIsNotARereview(t *testing.T) {
 		t.Fatalf("responses = %+v, want an ordinary fix", calls)
 	}
 }
+
+// Yolo is standing consent to fix findings, not to waive coverage: on a review
+// parked on incomplete coverage it asks for the rest of the review once and
+// never sends an approval, however many times the gate is offered to it.
+func TestModel_Yolo_NeverApprovesAnIncompleteReview(t *testing.T) {
+	for _, status := range []types.StepStatus{types.StepStatusAwaitingApproval, types.StepStatusFixReview} {
+		t.Run(string(status), func(t *testing.T) {
+			sock, client, snapshot := captureRespond(t)
+			run := testRun()
+			fj := `{"findings":[],"summary":"clean","reviewed_paths":["a.go"]}`
+			run.Steps = []ipc.StepResultInfo{{StepName: types.StepReview, Status: status, FindingsJSON: &fj}}
+			m := NewModel(sock, client, run)
+			m.yoloMode = true
+			m.stepDiffLoaded[types.StepReview] = true
+			for range 3 {
+				if cmd := m.maybeAutoApproveCmd(); cmd != nil {
+					if msg := cmd(); msg != nil {
+						t.Fatalf("automatic response failed: %v", msg)
+					}
+				}
+			}
+			calls := snapshot()
+			if len(calls) != 1 || calls[0].Action != types.ActionRereview {
+				t.Fatalf("yolo responses = %+v, want exactly one rereview and never an approval", calls)
+			}
+			if m.yoloApproved[types.StepReview] {
+				t.Fatal("yolo recorded an approval for an incomplete review")
+			}
+		})
+	}
+}

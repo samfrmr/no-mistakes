@@ -375,7 +375,8 @@ has nothing to select there and ` + "`approve`" + ` would waive files nobody rea
 ` + "`no-mistakes axi respond --action rereview`" + `: the review step covers exactly the
 unverified files and the gate re-parks until the record is complete. Repeat it if
 the gate re-parks; do not approve to get past it unless the user decided to waive
-the coverage.
+the coverage. ` + "`--yes`" + ` never approves such a gate: it sends one rereview and then leaves a
+still-incomplete gate awaiting your response.
 
 A gate holding open ` + "`question-<id>`" + ` findings is not eligible either: a question
 is settled by ` + "`axi answer`" + `, never by a verdict, so ` + "`--yes`" + ` stands aside

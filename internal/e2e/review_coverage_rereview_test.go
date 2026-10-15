@@ -156,3 +156,46 @@ func TestReviewCoverageGateRereviewAdvancesOnceCoverageIsComplete(t *testing.T) 
 		t.Fatalf("review step = %+v, want completed by coverage and not skipped", review)
 	}
 }
+
+func runCoverageBranchWithYes(t *testing.T, lateCovers bool) (*Harness, string, string) {
+	t.Helper()
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: reviewCoverageScenario(t, lateCovers)})
+	if out, err := h.Run("init"); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	branch := "feature/root-clear"
+	h.CommitChange(branch, "root_clear.go", "package main\n", "root clear")
+	h.CommitChange(branch, "policy.yaml", "allow: []\n", "policy yaml")
+	out, err := h.Run("axi", "run", "--yes", "--intent", "Add the root clear command")
+	if err != nil {
+		t.Fatalf("axi run --yes: %v\n%s", err, out)
+	}
+	return h, branch, out
+}
+
+// --yes is standing consent to fix findings, never to waive coverage: when the
+// rereview it issues leaves a file unverified, the run stays parked at the
+// review gate instead of approving it.
+func TestReviewCoverageYesNeverApprovesAnIncompleteReview(t *testing.T) {
+	h, branch, out := runCoverageBranchWithYes(t, false)
+	if !strings.Contains(out, "gate:") || !strings.Contains(out, "step: review") {
+		t.Fatalf("--yes did not stop at the still-incomplete review gate:\n%s", out)
+	}
+	run := waitForStepStatus(t, h, branch, types.StepReview, types.StepStatusAwaitingApproval, 60*time.Second)
+	if run.Status == types.RunCompleted {
+		t.Fatalf("--yes advanced the run past an incomplete review: %+v", run)
+	}
+	if out, err := h.Run("axi", "abort"); err != nil {
+		t.Fatalf("abort: %v\n%s", err, out)
+	}
+}
+
+// ...and when the single rereview --yes issues does complete the coverage, the
+// run advances on a complete record.
+func TestReviewCoverageYesAdvancesOnceTheRereviewCompletesCoverage(t *testing.T) {
+	h, branch, out := runCoverageBranchWithYes(t, true)
+	run := h.WaitForRun(branch, 90*time.Second)
+	if run.Status != types.RunCompleted {
+		t.Fatalf("--yes with a completing rereview did not finish the run: status=%s error=%v\n%s", run.Status, run.Error, out)
+	}
+}

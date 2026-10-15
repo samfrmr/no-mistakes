@@ -238,7 +238,7 @@ func newAxiRunCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "auto-resolve eligible gates (fix findings, then accept) until a decision point or outcome; protected-path and Test unvalidated-work refusals require an explicit response, and an open review question requires `axi answer`")
+	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "auto-resolve eligible gates (fix findings, then accept) until a decision point or outcome; protected-path and Test unvalidated-work refusals require an explicit response, an open review question requires `axi answer`, and a review still parked on incomplete coverage after one rereview is never approved")
 	cmd.Flags().StringVar(&skipValue, "skip", "", "comma-separated pipeline steps to skip")
 	cmd.Flags().StringVar(&intent, "intent", "", "what the user set out to accomplish; '-' reads stdin to EOF (exclusive with --intent-file)")
 	cmd.Flags().StringVar(&intentFile, "intent-file", "", "read intent from this file, relative to the current directory (exclusive with --intent)")
@@ -1052,7 +1052,9 @@ func emitLaunchReceipt(cmd *cobra.Command, receipt ipc.LaunchReceipt) {
 // findings is fixed (every finding selected), and the resulting fix_review is
 // accepted; gates with only non-actionable findings are approved. Each step is
 // fixed at most once so a finding the fix cannot clear converges to an approval
-// instead of looping forever. Protected-path and Test unvalidated-work refusals
+// instead of looping forever. A review parked on incomplete coverage is never
+// approved: --yes sends one rereview and then leaves a still-incomplete gate for
+// an explicit response. Protected-path and Test unvalidated-work refusals
 // always return their gate for an explicit response, including under --yes, as
 // does a gate holding an open review question or an unreadable question history
 // (pipeline.HasUnansweredReviewQuestion / HasUnreadableReviewQuestionHistory).
@@ -1082,6 +1084,7 @@ func driveRunWithReconciler(ctx context.Context, progress io.Writer, client *ipc
 func driveRunScoped(ctx context.Context, progress io.Writer, client *ipc.Client, reconciler *runReconciler, runID string, autoApprove, explicitRun bool) (run *ipc.RunInfo, ciReady bool, err error) {
 	pp := &progressPrinter{w: progress, seen: map[string]string{}}
 	fixedSteps := map[string]bool{}
+	rereviewedSteps := map[string]bool{}
 	pendingGate := ""
 	for {
 		run, err := reconciler.Next(ctx)
@@ -1143,6 +1146,24 @@ func driveRunScoped(ctx context.Context, progress io.Writer, client *ipc.Client,
 				// Duplicate or delayed events can race persistence after a response.
 				// Keep waiting for an authoritative transition rather than answering
 				// the same gate twice.
+				continue
+			}
+			// A review parked on incomplete coverage must never be approved
+			// automatically: approval would certify files nobody read, and
+			// gateResolution reads a zero-finding gate as nothing to decide. --yes
+			// asks for the rest of the review once per step, which is a review
+			// action and not an approval, and then leaves a gate that is still
+			// incomplete awaiting an explicit operator response.
+			if isReviewCoverageGate(gate) {
+				if rereviewedSteps[gate.Name] {
+					fmt.Fprintf(progress, "%s: review coverage is still incomplete after a rereview; --yes never approves unverified files, so this gate stays awaiting a response (`no-mistakes axi respond --action rereview` asks again)\n", gate.Name)
+					return run, false, nil
+				}
+				rereviewedSteps[gate.Name] = true
+				if _, err := sendRespond(client, runID, types.StepName(gate.Name), types.ActionRereview, nil, nil, nil, nil, ""); err != nil {
+					return nil, false, fmt.Errorf("auto-resolve %s: %w", gate.Name, err)
+				}
+				pendingGate = gateKey
 				continue
 			}
 			action, findingIDs := gateResolution(gate, fixedSteps[gate.Name])
