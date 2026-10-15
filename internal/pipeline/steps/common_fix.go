@@ -177,6 +177,21 @@ func mergeReviewedPaths(first, second []string) []string {
 	return merged
 }
 
+// parkedCoverageRecord reads the findings payload a review gate parked on
+// incomplete coverage so a rereview can extend it. It refuses (false) anything
+// that cannot be extended without laundering the record: an unreadable payload,
+// one carrying a blocking finding (that is not a coverage-only park), and one
+// whose reviewed_paths holds an entry that is not a path at all - that entry
+// fails the strict coverage check whatever a later turn covers, so only a fresh
+// review can replace the record.
+func parkedCoverageRecord(raw string) (Findings, bool) {
+	findings, err := types.ParseFindingsJSON(raw)
+	if err != nil || hasBlockingFindings(findings.Items) || hasInvalidReviewedPath(findings.ReviewedPaths) {
+		return Findings{}, false
+	}
+	return findings, true
+}
+
 // uncoveredReviewMessage names why a clean review round is parked instead of
 // certifying the head: the reviewable files its reviewed_paths did not cover
 // (or the whole set when the field was omitted), and any path it claimed that

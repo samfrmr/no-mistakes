@@ -573,6 +573,15 @@ func gateFieldsForRun(gate stepView, runID string) []toon.Field {
 			"Do not approve or fix to get past a review question: that throws away the paused review pass instead of answering it",
 		}, help...)
 	}
+	// A review parked on incomplete coverage has no finding to fix, so `fix`
+	// refuses it and approve would waive the files nobody read. Rereview is the
+	// supported way to obtain the rest of the review, and it leads the help.
+	if isReviewCoverageGate(gate) {
+		help = append([]string{
+			"This review parked because its coverage record does not verify every reviewable file, not because it found a defect; `" + axiLogsFullCommand(gate.Name, runID) + "` names the unverified files. Run `" + respond + " --action rereview` to have the review step cover exactly those files and merge the result into this record; it re-parks on anything still uncovered, so only a complete review passes",
+			"Approving this gate waives the unverified files instead of reviewing them; use it only as a deliberate operator decision",
+		}, help...)
+	}
 	if pipeline.HasProtectedPathRefusal(gate.FindingsJSON) {
 		help = []string{
 			"Protected-path refusals require an explicit operator response; Approve is rejected.",
@@ -595,9 +604,19 @@ func gateFieldsForRun(gate stepView, runID string) []toon.Field {
 	))
 }
 
+// isReviewCoverageGate reports whether gate is a review parked solely on
+// incomplete coverage, the one gate types.ActionRereview applies to.
+func isReviewCoverageGate(gate stepView) bool {
+	return gate.Name == string(types.StepReview) && pipeline.IsCoverageOnlyReviewGate(gate.FindingsJSON)
+}
+
 func inspectionOnlyGateFields(gate stepView, runID string) []toon.Field {
+	actions := "approve|fix|skip"
+	if isReviewCoverageGate(gate) {
+		actions += "|rereview"
+	}
 	return gateFieldsWithHelp(gate, []string{
-		fmt.Sprintf("The explicitly selected gate for run %s is inspection-only here; respond with `no-mistakes axi respond --run %s --action approve|fix|skip`", runID, runID),
+		fmt.Sprintf("The explicitly selected gate for run %s is inspection-only here; respond with `no-mistakes axi respond --run %s --action %s`", runID, runID, actions),
 		fmt.Sprintf("Run `%s` to read the complete step summary and log", axiLogsFullCommand(gate.Name, runID)),
 	})
 }

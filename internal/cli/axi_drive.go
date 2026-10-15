@@ -1520,7 +1520,7 @@ func newAxiRespondCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().StringVar(&action, "action", "", "approve | fix | skip (required)")
+	cmd.Flags().StringVar(&action, "action", "", "approve | fix | skip | rereview (required); rereview applies only to a review gate parked on incomplete coverage")
 	cmd.Flags().StringVar(&runID, "run", "", "answer this run id directly, without resolving the current branch or worktree")
 	cmd.Flags().StringVar(&step, "step", "", "step to respond to (default: the step awaiting approval)")
 	cmd.Flags().StringVar(&findings, "findings", "", "comma-separated finding IDs to fix (with --action fix)")
@@ -1565,13 +1565,13 @@ func runAxiRespond(cmd *cobra.Command, ra respondArgs) error {
 	respondCmd := "no-mistakes axi respond" + runFlag(ra.runID)
 	act := types.ApprovalAction(strings.TrimSpace(ra.action))
 	switch act {
-	case types.ActionApprove, types.ActionFix, types.ActionSkip:
+	case types.ActionApprove, types.ActionFix, types.ActionSkip, types.ActionRereview:
 	case "":
 		return emitError(cmd, 2, "--action is required",
 			"Run `"+respondCmd+" --action approve|fix|skip`")
 	default:
 		return emitError(cmd, 2, fmt.Sprintf("unknown action %q", ra.action),
-			"Valid actions: approve, fix, skip")
+			"Valid actions: approve, fix, skip, rereview")
 	}
 
 	var env *axiEnv
@@ -1655,7 +1655,8 @@ func runAxiRespond(cmd *cobra.Command, ra respondArgs) error {
 	if act == types.ActionFix {
 		if len(findingIDs) == 0 && ra.addFinding == "" && len(ignoreIDs) == 0 {
 			return emitError(cmd, 2, "--action fix requires --findings <id,...>, --ignore <id,...>, or --add-finding <json>",
-				"Run `no-mistakes axi status"+runFlag(ra.runID)+"` to list finding IDs")
+				"Run `no-mistakes axi status"+runFlag(ra.runID)+"` to list finding IDs",
+				"A review gate with no findings that is parked on incomplete coverage has nothing to fix: run `"+respondCmd+" --action rereview` to have the review cover the unverified files")
 		}
 		if note := strings.TrimSpace(ra.instructions); note != "" && len(findingIDs) > 0 {
 			instructions = make(map[string]string, len(findingIDs))
@@ -1673,6 +1674,10 @@ func runAxiRespond(cmd *cobra.Command, ra respondArgs) error {
 		}
 	} else if len(ignoreIDs) > 0 || ra.findings != "" {
 		return emitError(cmd, 2, "--findings and --ignore apply only to --action fix")
+	}
+	if act == types.ActionRereview && (strings.TrimSpace(ra.instructions) != "" || ra.addFinding != "") {
+		return emitError(cmd, 2, "--instructions and --add-finding apply only to --action fix",
+			"A rereview takes no findings: the review step re-checks the files its parked round did not verify")
 	}
 
 	result, err := sendRespond(env.client, runID, stepName, act, findingIDs, ignoreIDs, instructions, added, ra.reason)

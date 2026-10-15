@@ -282,6 +282,16 @@ const (
 	// never a valid response to any other gate - the daemon sends it, not an
 	// operator (see docs concepts/review-conversation).
 	ActionAnswer ApprovalAction = "answer"
+	// ActionRereview asks the review step to extend its own coverage over the
+	// reviewable files its parked round did not verify. It is valid only at a
+	// review gate that parked SOLELY on incomplete coverage (no error or
+	// warning finding): such a gate has nothing for a fixer to fix, so the
+	// supported way forward used to be an approval that waived the unread files.
+	// The review step runs its focused coverage pass again over exactly the
+	// unverified files and merges the result into the parked record; the gate
+	// still parks on anything left uncovered, and only a complete record
+	// certifies the head. It changes no code and records no selection.
+	ActionRereview ApprovalAction = "rereview"
 )
 
 // AgentName identifies a supported agent backend. Explicit ACP targets use

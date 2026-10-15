@@ -213,9 +213,9 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 	// refuses the handler's own release, and the gate parks forever with every
 	// question answered.
 	switch action {
-	case types.ActionApprove, types.ActionFix, types.ActionSkip, types.ActionAbort, types.ActionAnswer:
+	case types.ActionApprove, types.ActionFix, types.ActionSkip, types.ActionAbort, types.ActionAnswer, types.ActionRereview:
 	default:
-		return RespondDispositions{}, fmt.Errorf("unrecognized approval action %q (valid: approve, fix, skip, abort, answer)", action)
+		return RespondDispositions{}, fmt.Errorf("unrecognized approval action %q (valid: approve, fix, skip, abort, answer, rereview)", action)
 	}
 	e.mu.Lock()
 	if !e.waiting {
@@ -230,6 +230,17 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 		refusal := e.waitingApprovalRefusal
 		e.mu.Unlock()
 		return RespondDispositions{}, errors.New(refusal)
+	}
+	// A rereview extends the coverage of a review that parked on coverage and
+	// nothing else. Any other gate is decided by the response its findings ask
+	// for, and re-running the review there would discard the parked pass; the
+	// refusal leaves the gate parked for a valid response.
+	if action == types.ActionRereview && (step != types.StepReview || !IsCoverageOnlyReviewGate(e.waitingFindings)) {
+		e.mu.Unlock()
+		return RespondDispositions{}, &RespondRefusal{
+			Message: "rereview applies only to a review gate parked on incomplete coverage with no blocking finding",
+			Help:    "Respond with approve, fix --findings <ids>, or skip, as the gate's findings ask",
+		}
 	}
 	response := approvalResponse{
 		action:         action,
@@ -491,7 +502,13 @@ type stepExecutionState struct {
 	// gate parked as fix_review and the answer round has to keep that context or
 	// the two answer paths disagree about the step's durable status. That is
 	// what skipFixExecution above is for.
-	answering              bool
+	answering bool
+	// coverageFindings re-enters a review step whose gate parked on incomplete
+	// coverage so it extends that parked record (types.ActionRereview). Like
+	// answering it changes no code and records no selection, and it too can be
+	// set together with fixing and skipFixExecution when the park was a
+	// fix_review gate.
+	coverageFindings       string
 	previousFindings       string
 	deferredFindings       string
 	roundNum               int
@@ -738,15 +755,22 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	// same way; only the bookkeeping before it and the state handed in differ.
 	// An answer is not a verdict, so it records no selection on the round -
 	// leaving one would read as the human declining the round's findings.
-	case types.ActionFix, types.ActionAnswer:
+	case types.ActionFix, types.ActionAnswer, types.ActionRereview:
 		state := stepExecutionState{
 			roundNum:        gate.round,
 			autoFixAttempts: gate.autoFixes,
 			executionMS:     duration,
 			currentRoundID:  gate.lastRoundID,
 		}
-		if response.action == types.ActionAnswer {
-			state.answering = true
+		if response.action == types.ActionAnswer || response.action == types.ActionRereview {
+			if response.action == types.ActionAnswer {
+				state.answering = true
+			} else {
+				if gate.step.Name() != types.StepReview {
+					return e.failRun(run, repo, fmt.Errorf("step %s: %q is only a review response", gate.step.Name(), types.ActionRereview), ctx)
+				}
+				state.coverageFindings = gate.findings
+			}
 			// Carry the parked gate's outstanding set into the finalize round.
 			// The live path keeps it in locals across `continue rounds`, so an
 			// answer there never loses it; this path rebuilds the state from
@@ -1226,6 +1250,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		Fixing:            state.fixing,
 		SkipFixExecution:  state.skipFixExecution,
 		FinalizingAnswers: state.answering,
+		CoverageFindings:  state.coverageFindings,
 		CarriedFindings:   answerRoundCarriedFindings(state.answering, outstandingFindings),
 		PreviousFindings:  state.previousFindings,
 		DeferredFindings:  state.deferredFindings,
@@ -1266,6 +1291,8 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 	// round - which IsFixRound then reads as one.
 	case state.answering:
 		nextTrigger = "answer"
+	case state.coverageFindings != "":
+		nextTrigger = "rereview"
 	case sctx.Fixing:
 		nextTrigger = "auto_fix"
 	}
@@ -1442,6 +1469,7 @@ rounds:
 				sctx.Fixing = true
 				sctx.AutoFixRound = true
 				sctx.FinalizingAnswers = false
+				sctx.CoverageFindings = ""
 				sctx.SkipFixExecution = false
 				sctx.PreviousFindings = fixableFindings
 				sctx.DeferredFindings = excludeFindingsJSON(effectiveFindings, findingIDList(fixableFindings))
@@ -1585,6 +1613,7 @@ rounds:
 				// A genuine fix round always executes its fixer, even when the
 				// round before it was an answer replay that suppressed one.
 				sctx.FinalizingAnswers = false
+				sctx.CoverageFindings = ""
 				sctx.SkipFixExecution = false
 				selectedFindings, mergedFindings, normalizedOutstanding, selectedForPersistence := normalizeFixSelection(effectiveFindings, response, carryFindings)
 				sctx.PreviousFindings = mergedFindings
@@ -1626,6 +1655,7 @@ rounds:
 					slog.Warn("failed to return step status to running", "step", stepName, "error", dbErr)
 				}
 				sctx.FinalizingAnswers = true
+				sctx.CoverageFindings = ""
 				// The carried set rides the PROMPT so the finalize turn
 				// re-adjudicates it, exactly as on the live path; it earns no
 				// pending-verification entries, because an answer dispatches no
@@ -1642,6 +1672,34 @@ rounds:
 				sctx.SkipFixExecution = true
 				nextTrigger = "answer"
 				slog.Info("review answers received, re-executing", "step", stepName)
+				continue rounds
+
+			case types.ActionRereview:
+				// The review parked on incomplete coverage and nothing else, and
+				// the operator asked for the rest of the review instead of
+				// waiving it. No code changed and nothing was decided, so like
+				// an answer this records no selection and earns no
+				// pending-verification entries; the step re-enters with the
+				// parked record and runs its focused coverage pass over the files
+				// that record left unverified. Whatever is still uncovered
+				// re-parks, so only a complete record ever completes the step.
+				//
+				// sctx.Fixing is deliberately left as the parked round set it: a
+				// fix_review gate stays fix_review, and SkipFixExecution keeps
+				// the fixer from re-running over already-fixed code.
+				if stepName != types.StepReview {
+					return false, "", fmt.Errorf("step %s: %q is only a review response", stepName, types.ActionRereview)
+				}
+				phaseStart = time.Now()
+				writeLog(fmt.Sprintf("rereview requested; extending the review's coverage after round %d", roundNum))
+				if dbErr := markRunning(); dbErr != nil {
+					slog.Warn("failed to return step status to running", "step", stepName, "error", dbErr)
+				}
+				sctx.FinalizingAnswers = false
+				sctx.CoverageFindings = effectiveFindings
+				sctx.SkipFixExecution = true
+				nextTrigger = "rereview"
+				slog.Info("review rereview requested, re-executing", "step", stepName)
 				continue rounds
 
 			default:

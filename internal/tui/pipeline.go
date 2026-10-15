@@ -259,6 +259,10 @@ func renderApprovalActions(showSelectionActions bool, allowFix bool, showDiff bo
 	primary := []string{renderAction("a", "approve")}
 	if allowFix {
 		fixLabel := "fix"
+		if totalCount == 0 {
+			// Only a coverage-parked review reaches here with nothing to select.
+			fixLabel = "rereview"
+		}
 		if selectedCount > 0 && selectedCount < totalCount {
 			fixLabel = fmt.Sprintf("fix (%d/%d)", selectedCount, totalCount)
 		}

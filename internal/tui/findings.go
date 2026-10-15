@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -19,7 +21,10 @@ func (m Model) awaitingActionState() (showSelectionActions bool, allowFix bool, 
 	}
 	items := m.findingItems(step.StepName)
 	if len(items) == 0 {
-		return false, false, 0, 0
+		// A review parked on incomplete coverage carries nothing to select,
+		// but it is not a gate with nothing to do: f requests a rereview of the
+		// unverified files (renderApprovalActions labels it by the zero total).
+		return false, m.isReviewCoverageGate(step), 0, 0
 	}
 	totalCount = len(items)
 	selected, ok := m.findingSelections[step.StepName]
@@ -248,4 +253,16 @@ func (m *Model) selectAllFindings(step types.StepName) {
 func (m *Model) clearAllFindings(step types.StepName) {
 	m.ensureFindingSelection(step)
 	m.findingSelections[step] = make(map[string]bool)
+}
+
+// isReviewCoverageGate reports whether step is a review gate that parked solely
+// on incomplete coverage, the one gate types.ActionRereview applies to. It
+// requires an observed findings payload so a gate whose findings the model has
+// not received yet is not mistaken for a zero-finding one.
+func (m Model) isReviewCoverageGate(step *ipc.StepResultInfo) bool {
+	if step == nil || step.StepName != types.StepReview {
+		return false
+	}
+	raw, ok := m.stepFindings[step.StepName]
+	return ok && pipeline.IsCoverageOnlyReviewGate(raw)
 }

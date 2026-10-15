@@ -279,13 +279,14 @@ no-mistakes axi respond --action approve
 no-mistakes axi respond --action fix --findings F1,F2 --instructions "optional guidance"
 no-mistakes axi respond --action fix --findings F1,F2 --ignore F3
 no-mistakes axi respond --action fix --add-finding '{"description":"...","action":"auto-fix"}'
+no-mistakes axi respond --action rereview
 no-mistakes axi respond --action skip
 no-mistakes axi respond --run <id> --action approve
 ```
 
 | Flag             | Type     | Default       | Description                                                          |
 | ---------------- | -------- | ------------- | -------------------------------------------------------------------- |
-| `--action`       | `string` | (none)        | `approve`, `fix`, or `skip`; required. A reviewer's open question is answered with [`axi answer`](#no-mistakes-axi-answer), not here |
+| `--action`       | `string` | (none)        | `approve`, `fix`, `skip`, or `rereview`; required. `rereview` applies only to a review gate parked on incomplete coverage (below). A reviewer's open question is answered with [`axi answer`](#no-mistakes-axi-answer), not here |
 | `--run`          | `string` | current-branch active run | Answer the gate of this run ID from any directory, without resolving the current branch or worktree |
 | `--step`         | `string` | awaiting step | Step to respond to                                                   |
 | `--findings`     | `string` | (none)        | Comma-separated finding IDs to fix with `--action fix`               |
@@ -295,6 +296,8 @@ no-mistakes axi respond --run <id> --action approve
 | `--add-finding`  | `string` | (none)        | JSON finding object to add and fix                                   |
 | `-y`, `--yes`    | `bool`   | `false`       | Auto-resolve subsequent eligible gates until a decision point or outcome |
 | `--wait`         | `duration` | `8m`        | Maximum time for pre-drive reads and post-response driving before the caller must reattach |
+
+A review gate that shows no blocking finding is parked because its coverage record does not verify every reviewable file, not because the reviewer found a defect: `fix` has nothing to select there and `approve` would waive the unverified files. `--action rereview` is the supported way to obtain the rest of the review. It sends the parked record back to the review step, which runs its focused coverage pass over exactly the unverified files and merges the result into that record, without repeating the whole review and without recording a decision on any finding. The gate re-parks, and can be rereviewed again, until the record covers every reviewable file; only then does the step complete. A rereview of a gate that carries an error or warning finding, or of any step other than review, is refused and the gate stays parked. `--instructions`, `--findings`, `--ignore`, and `--add-finding` do not apply to it. `--yes` does not issue a rereview: it still approves such a gate, so an unattended run can waive coverage; pass `rereview` yourself when coverage matters.
 
 Declines are explicit. With `--action fix`, every finding the gate shows must appear in `--findings` or `--ignore`; a response that leaves one out is refused with the unaccounted IDs named and the gate stays parked, so a partial selection can never silently decline the findings it omitted. An ID in both lists, or an ID the gate does not show, is refused the same way. A finding a previous response for the same step already decided may be omitted to keep that decision, including when recovery parks the same round again. Naming a finding previously chosen to fix in `--ignore` is refused too, because reverting an applied fix is out of scope for a gate response. The validation fails closed on the state it reads: if the gate's findings or this step's earlier decisions cannot be read, the response is refused, the gate stays parked, and the refusal names what could not be read. See [Finding decision history](/no-mistakes/reference/pipeline-steps/#finding-decision-history) for how these decisions are stored and carried into later rounds.
 

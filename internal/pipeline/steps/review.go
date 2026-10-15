@@ -462,7 +462,22 @@ Risk assessment (after listing all findings):
 	}
 	var findings Findings
 	var validationErrors []error
-	for attempt := 1; ; attempt++ {
+	// An operator's rereview of a coverage park (types.ActionRereview) does not
+	// re-roll the whole review: the parked round already read its files and
+	// recorded which, so the pass resumes from that record and the focused
+	// coverage turn below covers only what it left unverified. A payload that
+	// cannot be extended safely falls through to a full fresh review.
+	extending := false
+	if sctx.CoverageFindings != "" {
+		if prior, ok := parkedCoverageRecord(sctx.CoverageFindings); ok {
+			sctx.Log(fmt.Sprintf("rereview requested; extending the parked review over its %d unverified file(s) instead of repeating the whole review", len(uncoveredReviewablePaths(prior.ReviewedPaths, reviewable))))
+			findings = prior
+			extending = true
+		} else {
+			sctx.Log("rereview requested but the parked coverage record cannot be extended; running a fresh review")
+		}
+	}
+	for attempt := 1; !extending; attempt++ {
 		result, err := s.runReviewAgent(sctx, "agent review", sessionRole, opts)
 		if err == nil {
 			findings, err = parseReviewAnalyzerOutput(result)

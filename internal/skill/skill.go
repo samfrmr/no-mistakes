@@ -369,6 +369,14 @@ reported edit, then send ` + "`--action fix`" + ` to retry the unfinished step.
 The [protected-path reference](https://kunchenguid.github.io/no-mistakes/reference/repo-config/#protected_paths)
 owns the staging guard's scope and limitations.
 
+A ` + "`review`" + ` gate with no findings that names unverified files in its step log (and whose help
+leads with ` + "`--action rereview`" + `) parked on incomplete coverage, not on a defect. ` + "`fix`" + `
+has nothing to select there and ` + "`approve`" + ` would waive files nobody read, so send
+` + "`no-mistakes axi respond --action rereview`" + `: the review step covers exactly the
+unverified files and the gate re-parks until the record is complete. Repeat it if
+the gate re-parks; do not approve to get past it unless the user decided to waive
+the coverage.
+
 A gate holding open ` + "`question-<id>`" + ` findings is not eligible either: a question
 is settled by ` + "`axi answer`" + `, never by a verdict, so ` + "`--yes`" + ` stands aside
 there - as it does when the question history cannot be read end to end, which

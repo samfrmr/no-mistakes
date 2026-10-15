@@ -59,7 +59,13 @@ type StepContext struct {
 	// is what keeps the fixer from re-running over already-fixed code, and
 	// review.go's `FinalizingAnswers && !Fixing` exists because the
 	// combination is reachable - not to forbid it.
-	FinalizingAnswers     bool
+	FinalizingAnswers bool
+	// CoverageFindings is the parked review's findings payload when this round
+	// answers a types.ActionRereview: the review step extends that payload's
+	// coverage record over the files it left unverified instead of re-running
+	// the whole review. Empty on every other round type, and an unreadable or
+	// unusable payload makes the step fall back to a full fresh review.
+	CoverageFindings      string
 	ReviewStartingHeadSHA string
 	// CarriedFindings is the outstanding set an ANSWER round carries in, minus
 	// the reviewer's own open-question rows (see answerRoundCarriedFindings),

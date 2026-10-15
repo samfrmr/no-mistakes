@@ -153,6 +153,12 @@ func (m Model) respondCmd(action types.ApprovalAction) tea.Cmd {
 		if len(ids) == 0 && len(userAdded) == 0 && len(m.findingItems(step.StepName)) > 0 {
 			return nil
 		}
+		// A review parked on coverage alone has no finding to fix; the same key
+		// asks for the rest of the review instead of sending a fix the daemon
+		// would run with nothing to fix.
+		if len(ids) == 0 && len(userAdded) == 0 && m.isReviewCoverageGate(step) {
+			action = types.ActionRereview
+		}
 	}
 	return func() tea.Msg {
 		params := &ipc.RespondParams{
